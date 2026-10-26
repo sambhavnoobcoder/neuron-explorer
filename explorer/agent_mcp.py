@@ -255,6 +255,8 @@ def call(name, a):
         return get("/api/agent/names")
     if name == "head":
         r = get("/api/head", layer=a["layer"], head=a["head"])
+        if r.get("error"):
+            return {"error": r["error"]}
         slim = lambda lst: [{"neuron": f"L{c['layer']} N{c['n']}", "z": c["z"], "lens": c.get("lens", [])} for c in lst[:12]]
         toks = lambda lst: [f"{t['tok']} ({t['n']})" for t in lst[:16]]
         out = {"head": f"L{a['layer']} h{a['head']}", "kind": r.get("kind", "full_attention" if r["full"] else "linear_attention").replace("_", " "),

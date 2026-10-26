@@ -18,6 +18,8 @@ Writes <out>_L22.npz (--out defaults to stats/q35-4b for Qwen3.5-4B, stats/<org>
     resid_norm_q10_50_90   quantiles of the per-token residual norm leaving the layer
     push_norm_q10_50_90    the same for the stream an add push lands in (the scale for push sizes): the residual
                      leaving the layer, or the MLP output on models that normalise it (push_space says which)
+    push_scale       what a push on an activation reaches the push stream with, per unit of its down column (the
+                     block's residual scale: Granite, MiniCPM; 1 on most models)
     post_mlp_norm, model_type, model, layer, tokens
 """
 import argparse
@@ -147,7 +149,7 @@ def main():
         path = f"{out_prefix}_L{l}.npz"
         np.savez(path, pp_max=pp, nn_max=nn, pn_min=pn, np_min=np_, abs_max=abs_max, w_down=w_down,
                  resid_norm_q10_50_90=resid_q, push_norm_q10_50_90=push_q, push_space="mlp_out" if post else "residual",
-                 post_mlp_norm=post, model_type=model_type, model=a.model, layer=l,
+                 post_mlp_norm=post, push_scale=ar.push_scale(l), model_type=model_type, model=a.model, layer=l,
                  tokens=n_steps * a.seq_len * a.batch)
         print(f"L{l}: residual norm leaving the layer p10/p50/p90 = {resid_q.round(1)}"
               + (f"; MLP output, where pushes land before the post-MLP norm, {push_q.round(1)}" if post else ""))

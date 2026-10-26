@@ -103,7 +103,7 @@ def main():
     B = a.neurons_per_batch
     for l in layers:
         W = ar.mlps[l].down_w()  # [hidden, inter]
-        unit = norms[l] / W.float().norm(dim=0)  # [N]
+        unit = norms[l] / (W.float().norm(dim=0) * ar.push_scale(l))  # [N]
         out = {k: [] for k in ("up_tok", "down_tok", "up_kl", "down_kl")}
         t0 = time.time()
         for s in range(0, N, B):

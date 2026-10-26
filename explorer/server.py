@@ -682,7 +682,7 @@ def head_info(layer: int, head: int, top: int = 24):
     for side in ("reads", "writes", "q", "k"):
         for c in links[side]:
             c["lens"] = [v[t] for t in lens["up"][c["layer"], c["n"], :5]] if lens is not None else []
-    return {"layer": layer, "head": head, "kind": ARCH["layer_types"][layer],
+    return {"layer": layer, "head": head, "kind": ARCH["layer_types"][layer], **({"error": links["error"]} if "error" in links else {}),
             "full": ARCH["layer_types"][layer] != "linear_attention", "src": src, "reads": links["reads"], "writes": links["writes"], "q": links["q"], "k": links["k"],
             "read_toks": pool(links["reads"]), "write_toks": pool(links["writes"]),
             "q_toks": pool(links["q"]), "k_toks": pool(links["k"])}

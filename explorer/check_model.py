@@ -75,6 +75,11 @@ def main():
     for t, h in zip(d["layer_types"], d["heads"]):
         kinds[(t, h)] = kinds.get((t, h), 0) + 1
     print("  token mixers: " + ", ".join(f"{c} x {t} ({h} heads)" for (t, h), c in kinds.items()))
+    if any(s != 1.0 for s in ar.mlp_scale + ar.attn_scale):
+        print(f"  residual scales (each block's output times this into the residual): MLP {sorted(set(ar.mlp_scale))}, "
+              f"attention {sorted(set(ar.attn_scale))}")
+    if any(ar.parallel):
+        print(f"  attention and MLP run side by side on {sum(ar.parallel)} layers")
     print(f"  chat template: {'yes' if getattr(tok, 'chat_template', None) else 'no (plain User:/Assistant: transcript)'}; "
           f"stop tokens: {sorted(tok.decode([i]) for i in A.stop_ids(model, tok))}")
     if len({id(n) for n in ar.pre_norms}) != ar.n_layers and ar.pre_norms[0] is not None:
@@ -128,8 +133,31 @@ def main():
         at_in = run(at_input, True)
         at_out = run(lambda m, inp, out: out + delta * col.to(out.dtype), False)
         moved, agree = rel(at_in, base), rel(at_in, at_out)
-        check("push", agree < max(tol, 0.05 * moved) and moved > 1e-3,
+        # equal up to rounding: in float32 to tol; in bfloat16 a big push on a big residual rounds differently on the
+        # two sides by a few percent, still far below what a wrong push gives (a gap as large as the move itself)
+        check("push", agree < max(tol, (0.05 if dtype == torch.float32 else 0.25) * moved) and moved > 1e-3,
               f"neuron {n} +{delta:.3g}: input-side vs output-side push differ by {agree:.2e}; the push moved the logits by {moved:.2e}")
+        if ar.post_norms[l] is None:  # the push reaches the residual stream as its write column (scale included)
+            outs = {}
+            hk = ar.layers[l].register_forward_hook(
+                lambda m, i, o: outs.__setitem__("o", (o[0] if isinstance(o, tuple) else o)[0, -1].float()))
+            try:
+                with torch.inference_mode():
+                    model(input_ids=ids, use_cache=False)
+                    base_o = outs["o"]
+                    hp = mlp.down.register_forward_pre_hook(at_input)
+                    try:
+                        model(input_ids=ids, use_cache=False)
+                    finally:
+                        hp.remove()
+                    want = delta * ar.write_w(l)[:, n].float()
+            finally:
+                hk.remove()
+            e = rel(outs["o"] - base_o, want)
+            # the layer output is rounded to the model's dtype, by about eps of its own size (bfloat16: 1 / 128)
+            bound = max(tol, 1e-2) + 2 * torch.finfo(dtype).eps * float(base_o.norm()) / max(float(want.norm()), 1e-12)
+            check("resid", e < bound, f"the push moves the layer's residual output by {ar.mlp_scale[l]:g} x delta x its "
+                  f"down column, relative error {e:.2e} (bound {bound:.1e})")
         if ar.pre_norms[l] is not None:
             h_in, h_out = (t.detach() for t in rec[("n", l)])
             s = ar.pre_scale(l)
@@ -172,9 +200,13 @@ def main():
         cap = getattr(ar.config, "final_logit_softcapping", None)
         if cap:  # Gemma 2 squashes its logits; monotonic, so the lens's rankings are unaffected
             lens = torch.tanh(lens / cap) * cap
-        e = rel(lens, base[: ar.n_vocab])
-        check("lens", e < max(tol, 1e-2), f"final norm + unembedding vs the model's own logits, relative error {e:.2e}"
-              + (f" (after the model's logit softcap of {cap})" if cap else ""))
+        # a constant scale after the unembedding (Granite's logits_scaling) leaves the lens's rankings alone too
+        ref = base[: ar.n_vocab]
+        k = float((lens * ref).sum() / (lens * lens).sum().clamp(min=1e-30))
+        e = rel(k * lens, ref)
+        check("lens", e < max(tol, 1e-2) and k > 0, f"final norm + unembedding vs the model's own logits, relative error "
+              f"{e:.2e}" + (f" (after the model's logit softcap of {cap})" if cap else "")
+              + (f" (the model then scales logits by {k:.4g})" if abs(k - 1) > 1e-3 else ""))
     else:
         print("  info   lens   no final norm found by tracing; the lens uses the unembedding directly")
     with torch.inference_mode():
@@ -219,9 +251,13 @@ def check_heads(rt, dev, tol):
     check("capture", not missing, f"queries/keys captured on {len(caps['q'])} of {sum(k is not None for k in kinds)} "
           f"head-capable layers" + (f"; missing {missing}" if missing else ""))
     if want:
+        # the model returns its attention weights only in eager mode, so the capture runs there too (sdpa, the usual
+        # default, can differ: it leaves out Gemma 2's softcap, and the capture follows whichever runs)
         impl = getattr(rt.model.config, "_attn_implementation", None)
         try:
             rt.model.set_attn_implementation("eager")
+            rt.full_activations(ids, heads=True)
+            caps_e = rt.heads
             with torch.inference_mode():
                 att = rt.model(input_ids=torch.tensor([ids], device=dev), output_attentions=True, use_cache=False).attentions
         finally:
@@ -232,11 +268,11 @@ def check_heads(rt, dev, tol):
             if ref is None:
                 print(f"  info   pattern L{l}: the model returns no attention weights to compare with")
                 continue
-            mine = torch.tensor(rt.layer_patterns(l, caps))
+            c = caps_e["q"][l]
+            mine = torch.tensor(rt.layer_patterns(l, caps_e))
             e = float((mine - ref[0].float().cpu()).abs().max())
             # float32 resolves a logit of size x to about x * 2^-23: Pythia's reach 1e5, enough to move its softmax
             # by 1e-2 in any float32 computation, the model's own included
-            c = caps["q"][l]
             big = float(((c["q"].float() @ c["k"].float().repeat_interleave(c["q"].shape[0] // c["k"].shape[0], 0)
                           .transpose(1, 2)) * c["scale"]).abs().max())
             bound = max(max(tol, 1e-3) * 5, 4 * big * 2.0 ** -23)

@@ -73,7 +73,10 @@ def load(model_name, device, dtype=torch.bfloat16):
     from transformers import AutoTokenizer
     rc = _remote_code()
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=rc)
-    model = model_class(model_name).from_pretrained(model_name, dtype=dtype, trust_remote_code=rc).to(device).eval()
+    # EXPLORER_ATTN picks transformers' attention implementation (eager, sdpa, ...); the default is transformers' own
+    # choice, sdpa on most models (which, for one, leaves out Gemma 2's attention-logit softcap)
+    attn = {"attn_implementation": os.environ["EXPLORER_ATTN"]} if os.environ.get("EXPLORER_ATTN") else {}
+    model = model_class(model_name).from_pretrained(model_name, dtype=dtype, trust_remote_code=rc, **attn).to(device).eval()
     return model, tok
 
 
@@ -105,6 +108,40 @@ def _weight(mod):
 def norm_eps(norm):
     """The epsilon a norm adds under its square root (RMSNorm's variance_epsilon or eps, LayerNorm's eps)."""
     return next((float(v) for k in ("variance_epsilon", "eps", "epsilon") if isinstance(v := getattr(norm, k, None), (int, float))), 1e-6)
+
+
+def _float_copy(norm):
+    """A float32 copy of a norm module, to probe without the model's rounding."""
+    import copy
+    return copy.deepcopy(norm).float()
+
+
+def residual_scale(cfg):
+    """The constant a block's output is multiplied by on its way into the residual stream, from the config: Granite's
+    residual_multiplier, MiniCPM's scale_depth / sqrt(layers); 1 for everything else."""
+    import math
+    c = text_config(cfg)
+    if isinstance(getattr(c, "residual_multiplier", None), (int, float)):
+        return float(c.residual_multiplier)
+    if isinstance(getattr(c, "scale_depth", None), (int, float)) and c.scale_depth:
+        return float(c.scale_depth) / math.sqrt(n_layers_of(cfg))
+    return 1.0
+
+
+def _branch_fit(target, base, branches):
+    """Least-squares scales s with target - base = sum s_i * branches_i over every traced token, from float32 tensors
+    only (in bfloat16 the residual's rounding swallows small updates and biases the fit), or None when a tensor is
+    missing, isn't float32, or the fit leaves more than 2% of the change unexplained. Within 2% of 1 comes back as 1."""
+    if target is None or base is None or any(b is None for b in branches):
+        return None
+    if any(t.dtype != torch.float32 for t in (target, base, *branches)):
+        return None
+    y = (target.detach().cpu().double() - base.detach().cpu().double()).reshape(-1)  # float64: CPU (MPS has none)
+    X = torch.stack([b.detach().cpu().double().reshape(-1) for b in branches], 1)
+    s = torch.linalg.lstsq(X, y[:, None]).solution[:, 0]
+    if float((X @ s - y).norm()) > 0.02 * float(y.norm()) + 1e-12:
+        return None
+    return [1.0 if abs(float(v) - 1) < 0.02 else float(v) for v in s]
 
 
 def _first_tensor(args, kwargs):
@@ -280,11 +317,11 @@ def stop_ids(model, tok):
     token. `model` is a loaded model, or a model name whose generation_config.json is read."""
     ids = set()
     if isinstance(model, str):
-        from transformers import GenerationConfig
+        from transformers import AutoConfig, GenerationConfig
         try:
             gc = GenerationConfig.from_pretrained(model)
-        except OSError:  # no generation_config.json
-            gc = None
+        except OSError:  # no generation_config.json: transformers takes the eos from config.json, as here
+            gc = GenerationConfig.from_model_config(AutoConfig.from_pretrained(model, trust_remote_code=_remote_code()))
     else:
         gc = getattr(model, "generation_config", None)
     eos = getattr(gc, "eos_token_id", None) if gc is not None else None
@@ -331,6 +368,10 @@ class Arch:
         self.attn_pre_norms = [None] * self.n_layers
         self.attn_post_norms = [None] * self.n_layers
         self.parallel = [False] * self.n_layers
+        # what each block's output is multiplied by on its way into the residual stream (Granite's residual_multiplier,
+        # MiniCPM's scale_depth / sqrt(layers)); 1 on most models
+        self.mlp_scale = [residual_scale(model.config)] * self.n_layers
+        self.attn_scale = list(self.mlp_scale)
         self.final_norm = None
         self.traced = False
         if trace:
@@ -363,6 +404,8 @@ class Arch:
                 if id(m) not in inside and "norm" in type(m).__name__.lower():
                     hooks.append(m.register_forward_hook(norm_hook(("norm", l), name), with_kwargs=True))
             hooks.append(mlp.module.register_forward_hook(mlp_hook(l), with_kwargs=True))
+            hooks.append(layer.register_forward_hook(lambda mod, args, kwargs, out, l=l: rec.__setitem__(
+                ("layer", l), (_first_tensor(args, kwargs), out[0] if isinstance(out, tuple) else out)), with_kwargs=True))
             if self.attn[l][0] is not None:
                 hooks.append(getattr(layer, self.attn[l][0]).register_forward_hook(
                     lambda mod, args, kwargs, out, l=l: rec.__setitem__(
@@ -392,6 +435,21 @@ class Arch:
             # what each block reads before its norm: the same tensor means attention and MLP run side by side
             src = lambda norm, x: next((i for _, m, i, _ in norms if m is norm), None) if norm is not None else x
             self.parallel[l] = a_in is not None and _same(src(self.pre_norms[l], x_in), src(self.attn_pre_norms[l], a_in))
+            # the residual scale of each branch, by least squares over the traced tokens
+            out_of = lambda norm, x: next((o for _, m, _, o in norms if m is norm), None) if norm is not None else x
+            h_in, h_out = rec.get(("layer", l), (None, None))
+            m, a = out_of(self.post_norms[l], x_out), out_of(self.attn_post_norms[l], a_out)
+            h_mid = src(self.pre_norms[l], x_in)
+            # in float32 the trace also measures it, which catches a scale the config doesn't name
+            if self.parallel[l]:
+                fit = _branch_fit(h_out, h_in, [a, m])
+            else:
+                fm, fa = _branch_fit(h_out, h_mid, [m]), _branch_fit(h_mid, h_in, [a])
+                fit = [fa[0], fm[0]] if fm and fa else None
+            if fit and (abs(fit[0] - self.attn_scale[l]) > 0.02 or abs(fit[1] - self.mlp_scale[l]) > 0.02):
+                print(f"[arch] layer {l}: measured residual scales attention {fit[0]:.4g}, MLP {fit[1]:.4g} (the config "
+                      f"gives {self.mlp_scale[l]:.4g}); using the measured ones", flush=True)
+                self.attn_scale[l], self.mlp_scale[l] = fit
         self.final_norm = next((m for _, m, _, o in rec.get("final", []) if _same(o, rec.get("head_in"))), None)
         if self.final_norm is None:  # something between the norm and the head (a scale); the lens ignores it
             self.final_norm = next((getattr(self.lm, n) for n in ("norm", "final_layernorm", "final_layer_norm",
@@ -406,19 +464,14 @@ class Arch:
         if norm is None:
             return torch.ones(self.hidden, device=dev)
         if id(norm) not in self._scales:
-            p = next((t for t in norm.parameters()), self.head.weight)
-            # a float32 probe keeps the scale exact on bfloat16 models (RMSNorms compute in float32 anyway); a norm
-            # that insists on its own dtype (torch's LayerNorm) gets the probe in that dtype
-            for dt in (torch.float32, p.dtype):
-                e = torch.ones(self.hidden, device=dev, dtype=dt)
-                e[1::2] = -1
-                try:
-                    with torch.inference_mode():
-                        d = norm(e[None, None]).float() - norm(-e[None, None]).float()
-                    break
-                except RuntimeError:
-                    continue
-            self._scales[id(norm)] = (d[0, 0] / (2 * e.float())).clone()
+            # on a float32 copy, so the scale is exact on bfloat16 models too; a probe of size 1e3 makes the norm's
+            # epsilon negligible (it adds eps / 1e6 under the square root)
+            f = _float_copy(norm)
+            e = torch.ones(self.hidden, device=dev, dtype=torch.float32)
+            e[1::2] = -1
+            with torch.inference_mode():
+                d = f(1e3 * e[None, None]).float() - f(-1e3 * e[None, None]).float()
+            self._scales[id(norm)] = (d[0, 0] / (2 * e)).clone()
         return self._scales[id(norm)]
 
     def norm_centred(self, norm):
@@ -426,10 +479,10 @@ class Arch:
         the module: a centring norm maps a constant vector and its negative to the same output."""
         key = ("centred", id(norm))
         if key not in self._scales:
-            p = next((t for t in norm.parameters()), self.head.weight)
-            e = torch.ones(1, 1, self.hidden, device=self.head.weight.device, dtype=p.dtype)
+            f = _float_copy(norm)
+            e = torch.ones(1, 1, self.hidden, device=self.head.weight.device, dtype=torch.float32)
             with torch.inference_mode():
-                self._scales[key] = bool(torch.allclose(norm(e).float(), norm(-e).float(), atol=1e-4))
+                self._scales[key] = bool(torch.allclose(f(e).float(), f(-e).float(), atol=1e-4))
         return self._scales[key]
 
     def pre_scale(self, l):
@@ -438,12 +491,18 @@ class Arch:
 
     def write_w(self, l):
         """[hidden, N] in the model's dtype: neuron n's write into the residual stream, column n (the down column, scaled
-        by the post-MLP norm when there is one; that norm also divides by the whole MLP output's rms, which no
-        per-neuron direction can show)."""
+        by the post-MLP norm when there is one, and by the block's residual scale; the post-MLP norm also divides by
+        the whole MLP output's rms, which no per-neuron direction can show)."""
         w = self.mlps[l].down_w()
-        if self.post_norms[l] is None:
-            return w
-        return w * self.norm_scale(self.post_norms[l]).to(w.dtype)[:, None]
+        if self.post_norms[l] is not None:
+            w = w * self.norm_scale(self.post_norms[l]).to(w.dtype)[:, None]
+        return w * self.mlp_scale[l] if self.mlp_scale[l] != 1.0 else w
+
+    def push_scale(self, l):
+        """How much of a push on a neuron's activation reaches the residual stream per unit of its down column: the
+        block's residual scale, for pushes measured in the residual stream (1 when the MLP output is normalised and
+        pushes are measured before that norm)."""
+        return self.mlp_scale[l] if self.post_norms[l] is None else 1.0
 
     # ---------- attention heads ----------
     def attn_kind(self, l):
@@ -589,11 +648,17 @@ CAPTURE = {}
 
 
 def _capturing(fn):
+    import inspect
+    try:  # only a function that takes `softcap` applies it (sdpa receives Gemma 2's softcap and ignores it)
+        softcaps = "softcap" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        softcaps = False
+
     def attn(module, query, key, value, attention_mask, *args, **kwargs):
         c = CAPTURE.get(id(module))
         if c is not None:  # [batch, heads, T, dim]: the queries, keys and values the softmax uses, after rotary
-            c.update(q=query[0], k=key[0], v=value[0], scaling=kwargs.get("scaling"), softcap=kwargs.get("softcap"),
-                     window=kwargs.get("sliding_window"))
+            c.update(q=query[0], k=key[0], v=value[0], scaling=kwargs.get("scaling"),
+                     softcap=kwargs.get("softcap") if softcaps else None, window=kwargs.get("sliding_window"))
         return fn(module, query, key, value, attention_mask, *args, **kwargs)
     attn._explorer = True
     return attn

@@ -388,6 +388,7 @@ class Runtime:
                 if l not in c["y"]:
                     continue
                 Jl = J * a.attn_post_scale(l) / c["orms"][l][pos].float() if l in c["orms"] else J
+                Jl = Jl * a.attn_scale[l]  # the block's residual scale (Granite, MiniCPM)
                 W = A._weight(a.attn[l][1]).float()
                 y = c["y"][l][:, pos].float()  # [H, D]
                 t = (W.T @ Jl).view(y.shape)
@@ -773,7 +774,7 @@ class Runtime:
         if mode == "mul":
             vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
         else:
-            unit = self.push_norm(layer) / float(self.down_col(layer, n).norm())
+            unit = self.push_norm(layer) / (float(self.down_col(layer, n).norm()) * self.arch.push_scale(layer))
             vals = [r * dose * unit for r in rows]
         return (layer, n, mode, torch.tensor(vals, device=self.dev))
 

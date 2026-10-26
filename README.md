@@ -95,8 +95,9 @@ stops generation, and that the attention-head tools (patterns, drive, links) agr
 
 All checks pass on Qwen3.5-0.8B, Qwen3-0.6B, Qwen2.5-0.5B-Instruct, SmolLM2-135M-Instruct (Llama), gemma-3-270m-it,
 gemma-3-1b-it, OLMo-2-0425-1B-Instruct, GPT-2 and Pythia-70m. Mixture-of-experts MLPs and layers of different MLP widths
-are refused with an error. Models that need custom code load with `EXPLORER_TRUST_REMOTE_CODE=1`; `EXPLORER_DEVICE`
-and `EXPLORER_DTYPE` (default `bfloat16`) override the device and precision.
+are refused with an error. Models that need custom code load with `EXPLORER_TRUST_REMOTE_CODE=1`; `EXPLORER_DEVICE`,
+`EXPLORER_DTYPE` (default `bfloat16`) and `EXPLORER_ATTN` (transformers' attention implementation, e.g. `eager`) override
+the device, precision and attention.
 
 - **Caches**: `explorer/cache/` holds Qwen3.5-4B's; any other model gets `explorer/cache/<org>--<name>/`. At startup
   the server builds the logit-lens index and the activation scale (10k tokens of FineWeb-Edu) there, and lists the
@@ -114,6 +115,9 @@ and `EXPLORER_DTYPE` (default `bfloat16`) override the device and precision.
 - **Chat**: the tokenizer's chat template, with thinking off where it has the switch; a model without one (GPT-2,
   Pythia, many base models) gets a plain `User: / Assistant:` transcript. Replies stop on generation_config's eos ids,
   the tokenizer's eos and the template's end-of-turn token.
+- **Residual scales**: a block whose output enters the residual stream multiplied by a constant (Granite's
+  `residual_multiplier`, MiniCPM's `scale_depth`) has that constant measured in the traced pass and folded into push
+  sizes, write directions and attention drive; `check_model.py` checks that a push moves the residual by exactly that.
 - **Post-MLP norms** (Gemma 2/3, OLMo 2): these models normalise the MLP output before adding it to the residual
   stream. A push on a neuron passes through that norm, so it saturates: at most it turns the layer's MLP write into
   the neuron's direction. Add doses on these models are fractions of the MLP output's median norm instead of the
@@ -124,8 +128,9 @@ and `EXPLORER_DTYPE` (default `bfloat16`) override the device and precision.
   sliding-window) of any layout the adapter can cut into heads (separate, gated or fused q/k/v projections, GPT-2's
   `c_attn`, GPT-NeoX's `query_key_value`) and on Qwen3.5's Gated DeltaNet layers. Queries, keys and values come from
   the model's own attention call (`arch.install_capture`), so rotary embeddings, query/key norms, softcaps and sliding
-  windows are the model's; `check_model.py` compares the patterns with the attention weights the model returns
-  itself, and checks that attention drive splits add up. A layer whose attention can't be cut into heads has the head
+  windows are the model's, as is the attention implementation's handling of them (sdpa, transformers' default for
+  Gemma 2, leaves out its attention-logit softcap; `EXPLORER_ATTN=eager` keeps it); `check_model.py` compares the
+  patterns with the attention weights the model returns itself, and checks that attention drive splits add up. A layer whose attention can't be cut into heads has the head
   tools off, and says so.
 - **Claude**: the agent's prompt gets the model's name, shape, head layout and dose unit filled in; the method's
   example neurons stay Qwen3.5-4B's and are labelled as such.

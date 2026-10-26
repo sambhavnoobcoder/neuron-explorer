@@ -107,12 +107,12 @@ class HFRunner:
     """Batched greedy rollouts in transformers, each row with its own push: a vector added to the output of the steered
     layer's MLP output projection at every position (add * W_down[:, n] for a neuron, add * v for a control)."""
 
-    def __init__(self, model_name, layer, device, batch):
+    def __init__(self, model_name, layer, device, batch, stop):
         import torch
         self.torch = torch
         self.model, self.tok = A.load(model_name, device, A.dtype_from_env())
         ar = A.Arch(self.model, self.tok, name=model_name)
-        self.stop = A.stop_ids(self.model, self.tok)
+        self.stop = set(stop)
         self.dev, self.batch, self.vec = device, batch, None
         self.last = {"logits_to_keep": 1} if "logits_to_keep" in inspect.signature(self.model.forward).parameters else {}
         ar.mlps[layer].down.register_forward_hook(self._hook)
@@ -215,6 +215,9 @@ def main():
     push_p50 = float(st["push_norm_q10_50_90"][1]) if "push_norm_q10_50_90" in st.files else resid_p50
     push_space = str(st["push_space"]) if "push_space" in st.files else "residual"
     post_mlp_norm = bool(st["post_mlp_norm"]) if "post_mlp_norm" in st.files else False
+    # a push of `add` on the activation reaches the push stream as add * push_scale * W_down[:, n] (the block's
+    # residual scale: Granite's residual_multiplier, MiniCPM's scale_depth; 1 on most models)
+    push_scale = float(st["push_scale"]) if "push_scale" in st.files else 1.0
     down_norm = np.linalg.norm(w_down.astype(np.float32), axis=1)
 
     from transformers import AutoConfig, AutoTokenizer  # before vllm, which re-registers some config classes
@@ -239,13 +242,15 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=rc)
     prompt_ids = {k: A.chat_ids(tok, [{"role": "user", "content": v}]) for k, v in PROMPTS.items()}
+    stop = sorted(A.stop_ids(model, tok))
 
     os.makedirs(a.out_dir, exist_ok=True)
     out_path = os.path.join(a.out_dir, f"{a.run}.jsonl")
     with open(os.path.join(a.out_dir, f"{a.run}.meta.json"), "w") as f:
         json.dump({"model": model, "layer": layer, "stats": os.path.abspath(a.stats), "prompts": PROMPTS,
                    "design_name": a.design, "design": design, "resid_norm_p50": resid_p50,
-                   "push_norm_p50": push_p50, "push_space": push_space, "dose_unit": a.dose_unit,
+                   "push_norm_p50": push_p50, "push_space": push_space, "push_scale": push_scale,
+                   "dose_unit": a.dose_unit, "stop_token_ids": stop,
                    "backend": a.backend, "hook": hook or "down_proj_out", "max_tokens": a.max_tokens, "top_k": a.top_k,
                    "capture_layers": cap_layers, "captured": captured, "capture_hook": "mlp_in",
                    "capture_positions": "last_prompt", "capture_root": os.path.abspath(a.capture_root) if captured else None,
@@ -288,10 +293,10 @@ def main():
         if ref is None:
             job["add"] = 0.0
         elif a.dose_unit == "rel":
-            job["add"] = float(d * push_p50 / down_norm[ref])
+            job["add"] = float(d * push_p50 / (down_norm[ref] * push_scale))
         else:
             job["add"] = float(d * abs_max[ref])
-        job["rel_push"] = abs(job["add"]) * float(down_norm[ref]) / push_p50 if ref is not None else 0.0
+        job["rel_push"] = abs(job["add"]) * float(down_norm[ref]) * push_scale / push_p50 if ref is not None else 0.0
         job["capture_id"] = f"L{layer}_{kind}{n}_{p}_{d:+g}".replace("+", "p").replace("-", "m")
         return job
 
@@ -308,10 +313,14 @@ def main():
         )
 
         def params(job):
-            kw = {"temperature": 0.0, "max_tokens": a.max_tokens, "logprobs": a.top_k}
+            # the same stop tokens as the hf backend and the explorer (generation_config's eos, the tokenizer's eos and
+            # the chat template's end-of-turn token)
+            kw = {"temperature": 0.0, "max_tokens": a.max_tokens, "logprobs": a.top_k, "stop_token_ids": stop}
             if job["ref_neuron"] is not None:
+                # the fork adds the vector to the residual (post_block) or to the branch the residual adds (mlp_out):
+                # the activation push times the block's residual scale
                 kw["steering_vectors"] = {hook: {layer: {"vector": direction(job["kind"], job["neuron"]).tolist(),
-                                                         "scale": job["add"]}}}
+                                                         "scale": job["add"] * push_scale}}}
             if captured:
                 kw["capture"] = {"filesystem": {
                     "request_id": job["capture_id"], "tag": a.run, "layout": a.capture_layout,
@@ -325,7 +334,7 @@ def main():
                                 [params(j) for j in chunk], use_tqdm=False)
             return [rollout_record(out, job, layer, a.top_k) for job, out in zip(chunk, outs)]
     else:
-        hf = HFRunner(model, layer, a.device or A.default_device(), a.batch)
+        hf = HFRunner(model, layer, a.device or A.default_device(), a.batch, stop)
 
         def run(chunk):
             vecs = [direction(j["kind"], j["neuron"]) * j["add"] if j["ref_neuron"] is not None
