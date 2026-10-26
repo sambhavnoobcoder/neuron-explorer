@@ -4,17 +4,24 @@ unsteered, a distinct steering config per request, and steering plus a last_prom
     uv run python sweep/bench.py --stats stats/q35-4b_L22.npz --n 1280 --max-num-seqs 320
 """
 import argparse
+import os
+import sys
 import time
 
 import numpy as np
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from vllm.inputs import TokensPrompt
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "explorer"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import arch as A  # noqa: E402
+import vllm_hooks  # noqa: E402
+from vllm import LLM, SamplingParams  # noqa: E402
+from vllm.inputs import TokensPrompt  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--model", default=None, help="defaults to the model the stats file was made for")
     ap.add_argument("--stats", required=True)
     ap.add_argument("--n", type=int, default=1280)
     ap.add_argument("--tokens", type=int, default=256)
@@ -25,24 +32,30 @@ def main():
     a = ap.parse_args()
 
     st = np.load(a.stats)
+    model = a.model or (str(st["model"]) if "model" in st.files else A.DEFAULT_MODEL)
     layer, abs_max, w_down = int(st["layer"]), st["abs_max"], st["w_down"]
-    tok = AutoTokenizer.from_pretrained(a.model)
-    enc = tok.apply_chat_template([{"role": "user", "content": "Describe the color orange."}],
-                                  add_generation_prompt=True, enable_thinking=False, tokenize=True)
-    ids = list(enc["input_ids"] if hasattr(enc, "keys") else enc)
-    llm = LLM(model=a.model, dtype="bfloat16", enable_steering=True, max_steering_configs=a.max_configs,
+    raw = A.raw_config(model)
+    hook, why = vllm_hooks.push_hook(raw.get("model_type", ""), bool(st["post_mlp_norm"]) if "post_mlp_norm" in st.files else False)
+    if hook is None:
+        raise SystemExit(f"--backend vllm can't steer {model}: {why}")
+    capture = vllm_hooks.can_capture_mlp_in(raw.get("model_type", ""))
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=A._remote_code())
+    ids = A.chat_ids(tok, [{"role": "user", "content": "Describe the color orange."}])
+    llm = LLM(model=model, dtype="bfloat16", enable_steering=True, max_steering_configs=a.max_configs,
               max_num_seqs=a.max_num_seqs, max_model_len=len(ids) + a.tokens + 16, gpu_memory_utilization=a.gpu_mem,
-              limit_mm_per_prompt={"image": 0, "video": 0},
-              capture_consumers=[{"name": "filesystem", "params": {"root": "/tmp/bench-captures"}}])
+              capture_consumers=[{"name": "filesystem", "params": {"root": "/tmp/bench-captures"}}] if capture else None,
+              **({"limit_mm_per_prompt": {"image": 0, "video": 0}} if "vision_config" in raw else {}))
     prompts = [TokensPrompt(prompt_token_ids=ids)] * a.n
     base = {"temperature": 0.0, "max_tokens": a.tokens, "ignore_eos": True}
 
     def steer(i):
         n = i % len(abs_max)
-        return {"steering_vectors": {"mlp_out": {layer: {"vector": w_down[n].astype(np.float32).tolist(),
-                                                         "scale": float(0.5 * abs_max[n])}}}}
+        return {"steering_vectors": {hook: {layer: {"vector": w_down[n].astype(np.float32).tolist(),
+                                                    "scale": float(0.5 * abs_max[n])}}}}
 
     def cap(i):
+        if not capture:  # the fork can't capture mlp_in on this model; capture conditions run without it
+            return {}
         return {"capture": {"filesystem": {"request_id": f"b{i}", "tag": "bench", "layout": "packed",
                                            "hooks": {"mlp_in": [layer, layer + 1, layer + 4, layer + 8]}, "positions": "last_prompt"}}}
 
@@ -65,8 +78,9 @@ def main():
         outs = llm.generate(prompts, params, use_tqdm=False)
         dt = time.time() - t1
         n_tok = sum(len(o.outputs[0].token_ids) for o in outs)
-        eos = tok.convert_tokens_to_ids("<|im_end|>")
-        kept = sum((list(o.outputs[0].token_ids) + [eos]).index(eos) for o in outs)
+        stop = A.stop_ids(model, tok)
+        kept = sum(next((k for k, t in enumerate(o.outputs[0].token_ids) if t in stop), len(o.outputs[0].token_ids))
+                   for o in outs)
         print(f"{name:18s} {n_tok / dt:8,.0f} gen tok/s  {kept / dt:8,.0f} kept tok/s  {a.n / dt:6.1f} rollouts/s  "
               f"(building params {t1 - t0:.1f}s)",
               flush=True)
