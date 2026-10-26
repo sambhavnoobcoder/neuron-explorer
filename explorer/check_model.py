@@ -1,8 +1,8 @@
 """Checks a model against everything the explorer and the sweep assume about it (explorer/arch.py), on a few layers,
 and prints what it found. Run it once before exploring or sweeping a new model; it exits non-zero on a failure.
 
-    uv run python scripts/check_model.py --model Qwen/Qwen2.5-0.5B-Instruct
-    uv run python scripts/check_model.py --model google/gemma-3-1b-it --device cpu --dtype float32
+    uv run python explorer/check_model.py --model Qwen/Qwen2.5-0.5B-Instruct
+    uv run python explorer/check_model.py --model google/gemma-3-1b-it --device cpu --dtype float32
 
 Checks, each on the first, a middle and the last layer:
     acts      neuron activations recomputed from the MLP input (act(gate) * up from the gate and up weights) match the
@@ -15,14 +15,21 @@ Checks, each on the first, a middle and the last layer:
     heads     scaling the attention output projection's input to zero changes the logits (head ablation is live)
     stop      the chat template's end-of-turn token (the one after an assistant message) is among the stop tokens
     chat      a greedy reply to a chat prompt, for a look (base models ramble; that is not a failure)
+Then, through the explorer's own runtime (runtime.py), its attention-head tools:
+    pattern   softmax heads' patterns from the captured queries and keys equal the attention weights the model returns
+              itself in eager mode (output_attentions)
+    drive     attn_drive's linearised activation equals the real one, and each head's split over source tokens sums to
+              that head's contribution (true only when the captured values, gates and norms are the model's)
+    links     head links and a neuron's head roles come back from weights
 """
 import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "explorer"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arch as A  # noqa: E402
 
 TEXT = "The quick brown fox jumps over the lazy dog. In 1969, astronauts first walked on the Moon, and"
@@ -51,8 +58,12 @@ def main():
     dtype = getattr(torch, a.dtype)
     tol = a.tol or (1e-3 if dtype == torch.float32 else 3e-2)
 
-    model, tok = A.load(a.model, dev, dtype)
-    ar = A.Arch(model, tok, name=a.model)
+    # one copy of the model, loaded the way the explorer loads it (its hooks stay idle unless a capture or push runs)
+    os.environ.update(EXPLORER_MODEL=a.model, EXPLORER_DEVICE=dev, EXPLORER_DTYPE=str(dtype).replace("torch.", ""))
+    import runtime as R
+    rt = R.Runtime("stats")
+    rt.ensure_loaded()
+    model, tok, ar = rt.model, rt.tok, rt.arch
     d = ar.describe()
     print(f"{a.model}: {d['n_layers']} layers, {d['inter']} {d['mlp']} neurons per layer ({ar.mlps[0].kind}: "
           f"{type(ar.mlps[0].down).__name__} {[n for n, m in ar.mlps[0].module.named_children() if m is ar.mlps[0].down][0]}), "
@@ -123,7 +134,7 @@ def main():
             h_in, h_out = (t.detach() for t in rec[("n", l)])
             s = ar.pre_scale(l)
             hf = h_in.float()
-            centred = "layernorm" in type(ar.pre_norms[l]).__name__.lower()
+            centred = ar.norm_centred(ar.pre_norms[l])
             if centred:
                 hf = hf - hf.mean(-1, keepdim=True)
             norm = ar.pre_norms[l]
@@ -189,8 +200,71 @@ def main():
         print("  info   stop   no chat template: replies end on eos or at the length cap")
     print(f"  info   chat   {'stopped' if done else 'no stop within 60 tokens'}: {reply[:120]!r}")
 
+    check_heads(rt, dev, tol)
     print(f"\n{'all checks passed' if not failed else 'FAILED: ' + ', '.join(sorted(set(failed)))}")
     sys.exit(1 if failed else 0)
+
+
+def check_heads(rt, dev, tol):
+    """The attention-head tools, through the explorer's runtime."""
+    ar = rt.arch
+    kinds = [ar.attn_kind(l) for l in range(ar.n_layers)]
+    print(f" heads: {dict((k, kinds.count(k)) for k in set(kinds))} (None = head tools off on that layer)")
+    ids = rt.tok(TEXT).input_ids
+    acts = rt.full_activations(ids, heads=True)  # [L, T, N]
+    caps = rt.heads
+    soft = [l for l in range(ar.n_layers) if kinds[l] == "softmax"]
+    want = sorted({soft[0], soft[len(soft) // 2], soft[-1]}) if soft else []
+    missing = [l for l in range(ar.n_layers) if kinds[l] and l not in caps["q"]]
+    check("capture", not missing, f"queries/keys captured on {len(caps['q'])} of {sum(k is not None for k in kinds)} "
+          f"head-capable layers" + (f"; missing {missing}" if missing else ""))
+    if want:
+        impl = getattr(rt.model.config, "_attn_implementation", None)
+        try:
+            rt.model.set_attn_implementation("eager")
+            with torch.inference_mode():
+                att = rt.model(input_ids=torch.tensor([ids], device=dev), output_attentions=True, use_cache=False).attentions
+        finally:
+            if impl:
+                rt.model.set_attn_implementation(impl)
+        for l in want:
+            ref = att[l] if att is not None and len(att) == ar.n_layers else None
+            if ref is None:
+                print(f"  info   pattern L{l}: the model returns no attention weights to compare with")
+                continue
+            mine = torch.tensor(rt.layer_patterns(l, caps))
+            e = float((mine - ref[0].float().cpu()).abs().max())
+            # float32 resolves a logit of size x to about x * 2^-23: Pythia's reach 1e5, enough to move its softmax
+            # by 1e-2 in any float32 computation, the model's own included
+            c = caps["q"][l]
+            big = float(((c["q"].float() @ c["k"].float().repeat_interleave(c["q"].shape[0] // c["k"].shape[0], 0)
+                          .transpose(1, 2)) * c["scale"]).abs().max())
+            bound = max(max(tol, 1e-3) * 5, 4 * big * 2.0 ** -23)
+            check("pattern", e < bound, f"L{l}: captured softmax pattern vs the model's own attention weights, max abs "
+                  f"difference {e:.2e} over {mine.shape[0]} heads x {mine.shape[1]} tokens (bound {bound:.1e}, "
+                  f"largest logit {big:.3g})")
+    for l in sorted({0, ar.n_layers // 2, ar.n_layers - 1}):
+        pos = len(ids) - 1
+        n = int(np.abs(acts[l, pos]).argmax())
+        d = rt.attn_drive(l, n, pos, caps, top=4)
+        real = float(acts[l, pos, n])
+        e_act = abs(d["act"] - real) / max(abs(real), 1e-6)
+        check("drive", e_act < max(tol, 1e-2), f"L{l} N{n}: linearised activation {d['act']:.4g} vs real {real:.4g}")
+        contrib = {(hl, h): c for hl, h, c in d["heads"]}
+        worst = max((abs(sum(v) - contrib[k]) / max(abs(contrib[k]), 1e-6) for k, v in d["src"].items()), default=0.0)
+        if d["src"]:
+            check("drive", worst < max(tol, 1e-2) * 3, f"L{l} N{n}: per-token source splits of the top heads sum to "
+                  f"their contributions (worst relative gap {worst:.2e}); {len(d['heads'])} heads read")
+        else:
+            print(f"  info   drive  L{l}: no head with a capture feeds this layer's MLP")
+    lh = next((l for l in range(ar.n_layers - 1, -1, -1) if kinds[l]), None)
+    if lh is not None:
+        links = rt.head_links(lh, 0, k=5)
+        roles = rt.neuron_head_roles(ar.n_layers // 2, 0, k=3)
+        reads = [f"L{c['layer']} N{c['n']}" for c in links["reads"][:3]]
+        check("links", all(len(links[s]) for s in ("reads", "q", "k")) and any(roles.values()),
+              f"L{lh} h0 reads from {reads}; L{ar.n_layers // 2} N0 roles "
+              + ", ".join(f"{r}: {len(v)}" for r, v in roles.items()))
 
 
 if __name__ == "__main__":

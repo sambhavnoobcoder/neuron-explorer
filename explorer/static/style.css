@@ -64,8 +64,16 @@ canvas { width: 100%; height: 100%; display: block; }
 #f-name { display: block; width: 100%; box-sizing: border-box; margin: 6px 0 10px; padding: 2px 0; background: none; border: 0; outline: none; color: var(--ink); font: 600 20px/1.3 var(--font); border-radius: 0; resize: none; overflow: hidden; overflow-wrap: anywhere; transition: box-shadow .4s; }
 #f-name.saved { box-shadow: 0 1px 0 #3c7a4b; }
 #tabs { display: flex; align-items: baseline; gap: 18px; padding: 10px 16px 0; }
-#tabs #a-new { margin-left: auto; font-size: 11px; }
-#focus:not(.on-claude) #a-new { display: none; }
+#tabs #a-agent { margin-left: auto; font-size: 11px; background: none; border: 0; color: var(--dim); cursor: pointer; }
+#tabs #a-past { font-size: 11px; }
+#tabs #a-new { font-size: 11px; }
+#tabs #a-past.on { color: var(--ink); }
+#focus:not(.on-claude) #a-new, #focus:not(.on-claude) #a-past, #focus:not(.on-claude) #a-agent { display: none; }
+.a-pastrow { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; padding: 8px 10px; border-radius: 6px; }
+.a-pastrow:hover { background: var(--raise); }
+.a-pastrow.on { background: var(--raise); }
+.a-pastrow .t { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.a-pastrow .m { font: 11px var(--mono); color: var(--faint); }
 #tabs button.fresh::after { content: ""; display: inline-block; width: 5px; height: 5px; margin-left: 5px; border-radius: 50%; background: var(--link); vertical-align: middle; }
 #tabs button { color: var(--dim); padding: 6px 0; }
 #tabs button.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
@@ -252,6 +260,11 @@ body.list-hidden #layer-back { left: 56px; }
 .chip { font: 11.5px var(--mono); background: var(--raise); border-radius: 3px; padding: 1px 5px; cursor: pointer; white-space: pre; }
 .chip:hover { background: rgba(255,255,255,0.14); }
 .chip i { font-style: normal; color: var(--faint); margin-left: 4px; font-size: 10px; }
+.nline { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; cursor: pointer; font-size: 12.5px; }
+.nline:hover { background: var(--raise); }
+.nline .id { font: 11px var(--mono); color: var(--faint); flex: none; width: 74px; }
+.nline .w { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nline .z { font: 11px var(--mono); color: var(--faint); font-variant-numeric: tabular-nums; }
 
 /* connections: each linked neuron's logit lens, faint, under its steer lens */
 tr.con .logit { margin-top: 2px; opacity: .5; }

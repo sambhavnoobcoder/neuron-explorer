@@ -75,13 +75,13 @@ The scripts take `--model` (the stats file names the model for everything after 
 | `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
 | `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
 | `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
-| `scripts/check_model.py` | checks a model against everything the explorer assumes about it |
+| `explorer/check_model.py` | checks a model against everything the explorer assumes about it |
 
 `research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
 
 ## Other models
 
-    uv run python scripts/check_model.py --model Qwen/Qwen2.5-0.5B-Instruct    # once per new model
+    uv run python explorer/check_model.py --model Qwen/Qwen2.5-0.5B-Instruct    # once per new model
     EXPLORER_MODEL=Qwen/Qwen2.5-0.5B-Instruct uv run python explorer/server.py
 
 Nothing about the model is written down per architecture: `explorer/arch.py` finds the decoder layers, the MLP (gated
@@ -90,8 +90,8 @@ the norms in front of and behind it, the attention heads, the final norm and the
 one traced forward pass, and reads each norm's per-channel scale off the module. `check_model.py` then confirms, on the
 first, a middle and the last layer, that the neuron activations recompute from the MLP input, that a push on a neuron
 equals adding its column to the MLP output and moves the logits, that the norm scales reproduce the norms, that the
-logit lens reproduces the model's own logits, that head ablation is live, and that the chat template's end-of-turn token
-stops generation.
+logit lens reproduces the model's own logits, that head ablation is live, that the chat template's end-of-turn token
+stops generation, and that the attention-head tools (patterns, drive, links) agree with the model.
 
 All checks pass on Qwen3.5-0.8B, Qwen3-0.6B, Qwen2.5-0.5B-Instruct, SmolLM2-135M-Instruct (Llama), gemma-3-270m-it,
 gemma-3-1b-it, OLMo-2-0425-1B-Instruct, GPT-2 and Pythia-70m. Mixture-of-experts MLPs and layers of different MLP widths
@@ -120,5 +120,12 @@ and `EXPLORER_DTYPE` (default `bfloat16`) override the device and precision.
   residual's: on gemma-3-270m layer 9 the residual's median norm is about 3,400 times the MLP output's, so in residual
   units every dose from 0.05 to 3 gives the same saturated text, while in MLP-output units the same doses run from
   subtle to broken. A neuron's write direction (logit lens, connections) includes the norm's per-channel scale.
+- **Attention heads**: patterns, attention drive and q / k / v / o roles work on softmax attention (full or
+  sliding-window) of any layout the adapter can cut into heads (separate, gated or fused q/k/v projections, GPT-2's
+  `c_attn`, GPT-NeoX's `query_key_value`) and on Qwen3.5's Gated DeltaNet layers. Queries, keys and values come from
+  the model's own attention call (`arch.install_capture`), so rotary embeddings, query/key norms, softcaps and sliding
+  windows are the model's; `check_model.py` compares the patterns with the attention weights the model returns
+  itself, and checks that attention drive splits add up. A layer whose attention can't be cut into heads has the head
+  tools off, and says so.
 - **Claude**: the agent's prompt gets the model's name, shape, head layout and dose unit filled in; the method's
   example neurons stay Qwen3.5-4B's and are labelled as such.

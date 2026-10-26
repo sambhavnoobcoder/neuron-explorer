@@ -1,4 +1,4 @@
-import { createMap } from "./map3d.js?v=70";
+import { createMap } from "./map3d.js?v=79";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
@@ -27,6 +27,8 @@ const tip = $("#tip");
 // ---------- map ----------
 const map = createMap($("#map"), $("#layer-labels"), arch, {
   onPick: (layer, n) => openNeuron(layer, n, "neuron", true, false),
+  onPickHead: (layer, head) => openHead(layer, head),
+  onPickLayer: l => { if (l !== state.layer) { layerSel.value = l; setLayer(l); } },
   onLayerMode: l => {
     $("#layer-back").classList.toggle("on", l !== null);
     $("#layer-back").textContent = l !== null ? `‹ all layers  ·  L${l}` : "";
@@ -34,6 +36,27 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
   },
   onHover: (p, x, y) => {
     if (!p) return hideTip();
+    if (p.type === "head") {
+      if (hoverKey !== `h/${p.layer}/${p.head}`) map.setHoverConnections(null);
+      const key = `h/${p.layer}/${p.head}`, head = `L${p.layer} h${p.head}`;
+      const body = () => {
+        const h = hoverCache.get(key);
+        const side = (sg, list) => list.slice(0, 3).map(c => `<div class="tl"><span class="sgn">${sg}</span><span class="faint">L${c.layer} N${c.n}</span>  ${esc(state.unitMap[c.layer]?.get(c.n)?.name || (c.lens || []).slice(0, 4).map(t => t.trim() || t).join("  "))}</div>`).join("");
+        return h ? side("←", h.reads) + side("→", h.writes) : "";
+      };
+      showTipHTML(x, y, head, body());
+      clearTimeout(hoverTimer);
+      hoverKey = key;
+      hoverTimer = setTimeout(async () => {
+        if (!hoverCache.has(key)) hoverCache.set(key, await api(`/api/head?layer=${p.layer}&head=${p.head}`));
+        if (hoverKey !== key) return;
+        const h = hoverCache.get(key);
+        if (!(state.focus && (state.focus.kind === "neuron" || state.focus.kind === "head")))
+          map.setHoverHead(p.layer, p.head, headRoleLinks(h));
+        showTipHTML(x, y, head, body());
+      }, 120);
+      return;
+    }
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
@@ -48,20 +71,34 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
       if (u) rows.push(`<div class="twords">${esc(u.words.join("  "))}</div>`);
       if (h && h.steer) rows.push(`<div class="tl"><span class="sgn up">+</span>${esc(h.steer.join("  "))}</div><div class="tl"><span class="sgn down">−</span>${esc(h.steer_neg.join("  "))}</div>`);
       if (h) rows.push(`<div class="tl faintline"><span class="sgn up">+</span>${esc(h.lens.join("  "))}</div><div class="tl faintline"><span class="sgn down">−</span>${esc(h.lens_neg.join("  "))}</div>`);
+      const nh = hoverCache.get(`nh/${key}`);
+      if (nh) {
+        const top = roleHeads(nh), into = top.filter(k => k.role === "o").slice(0, 3), from = top.filter(k => k.role !== "o").slice(0, 4);
+        if (into.length) rows.push(`<div class="tl faintline"><span class="sgn">←</span>${into.map(k => `L${k.layer} h${k.head}`).join("  ")}</div>`);
+        if (from.length) rows.push(`<div class="tl faintline"><span class="sgn">→</span>${from.map(k => `${k.role} L${k.layer} h${k.head}`).join("  ")}</div>`);
+      }
       return rows.join("");
     };
     showTipHTML(x, y, head, body());
     clearTimeout(hoverTimer);
     hoverTimer = setTimeout(async () => {
-      if (!hoverCache.has(key)) hoverCache.set(key, await api(`/api/hover?layer=${p.layer}&n=${p.n}`));
+      const [hv, nh] = await Promise.all([hoverCache.get(key) || api(`/api/hover?layer=${p.layer}&n=${p.n}`),
+        hoverCache.get(`nh/${key}`) || api(`/api/neuron/heads?layer=${p.layer}&n=${p.n}`)]);
+      hoverCache.set(key, hv); hoverCache.set(`nh/${key}`, nh);
       if (hoverKey !== key) return;
-      // with a neuron open, hover only shows the tooltip; its connections and web stay on screen
-      if (!(state.focus && state.focus.kind === "neuron")) map.setHoverConnections({ layer: p.layer, n: p.n }, hoverCache.get(key).con);
+      // with a neuron or head open, hover only shows the tooltip; its links and web stay on screen
+      if (!(state.focus && (state.focus.kind === "neuron" || state.focus.kind === "head"))) map.setHoverConnections({ layer: p.layer, n: p.n }, hoverCache.get(key).con);
       showTipHTML(x, y, head, body());
     }, 120);
     hoverKey = key;
   },
 });
+// a neuron's heads over all four roles (/api/neuron/heads roles), strongest first, each head once
+const roleHeads = r => {
+  const seen = new Set();
+  return ["q", "k", "v", "o"].flatMap(role => (r.roles?.[role] || []).map(x => ({ ...x, role }))).filter(x => x.z >= 3)
+    .sort((a, b) => b.z - a.z).filter(x => !seen.has(`${x.layer}/${x.head}`) && seen.add(`${x.layer}/${x.head}`));
+};
 function showTip(x, y, head, body) { showTipHTML(x, y, head, esc(body)); }
 function showTipHTML(x, y, head, html) {
   tip.innerHTML = `<div class="lab">${esc(head)}</div>${html}`;
@@ -204,6 +241,7 @@ function showLeft(t) {
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
+  lightHeads(state.inf.pos);
   if (leftTab === "run" && state.inf.text) { inferView(); showTokenPaths(state.inf.pos); return; }
   map.setMarks(leftTab === "net" && lensResults?.results ? lensResults.results : []);
   if (String(webKey).startsWith("tok/")) { webKey = null; refreshWeb(); }
@@ -263,7 +301,35 @@ async function showTokenPaths(pos) {
 function previewToken(pos) {
   const keep = state.inf.pos;
   state.inf.pos = pos; inferView(); state.inf.pos = keep;
-  showTokenPaths(pos);
+  showTokenPaths(pos); lightHeads(pos);
+}
+// on run, the head lines light by how much each head writes at the token (pinned or hovered), and with a head open
+// the token chips shade by where that head reads from there
+let headsGen = 0;
+async function lightHeads(pos) {
+  const g = ++headsGen, f = state.focus;
+  const on = leftTab === "run" && state.inf.text && pos >= 0;
+  const r = on ? await api(`/api/infer/heads?pos=${pos}`) : null;
+  if (g !== headsGen) return;
+  if (r?.layers) map.setHeadLevels(r.layers.map(row => row.map(v => Math.max(0, (v - 0.15) / 0.6))));
+  else if (f?.kind === "neuron" && state.nheads?.layer === f.layer && state.nheads.n === f.n) {
+    const lv = [];
+    for (const [l, zs] of Object.entries(state.nheads.layers)) lv[+l] = zs.map(z => Math.max(0, Math.min(1, (z - 2.5) / 5)));
+    map.setHeadLevels(lv);
+  } else map.setHeadLevels(null);
+  shadeTokens(on ? pos : -1);
+}
+let shadeGen = 0;
+async function shadeTokens(pos) {
+  const g = ++shadeGen, f = state.focus, btns = [...document.querySelectorAll("#inf-toks button")];
+  const r = pos >= 0 && f?.kind === "head" ? await api(`/api/head/row?layer=${f.layer}&head=${f.n}&pos=${pos}`) : null;
+  if (g !== shadeGen) return;
+  btns.forEach((b, i) => {
+    const w = r?.units?.[i];
+    b.style.background = w == null || b.classList.contains("on") ? "" :
+      `rgba(${w >= 0 ? "255,181,71" : "255,79,154"},${Math.min(0.85, Math.abs(w) * 1.6).toFixed(3)})`;
+    b.style.color = w != null && Math.abs(w) > 0.3 && !b.classList.contains("on") ? "#000" : "";
+  });
 }
 $("#inf-toks").addEventListener("pointerover", e => {
   const b = e.target.closest("button"); if (!b || tokHover === +b.dataset.i) return;
@@ -272,13 +338,13 @@ $("#inf-toks").addEventListener("pointerover", e => {
 });
 $("#inf-toks").addEventListener("pointerleave", () => {
   clearTimeout(tokTimer); tokHover = null;
-  inferView(); showTokenPaths(state.inf.pos);
+  inferView(); showTokenPaths(state.inf.pos); lightHeads(state.inf.pos);
 });
 $("#inf-toks").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
   state.inf.pos = state.inf.pos === +b.dataset.i ? -1 : +b.dataset.i;
   document.querySelectorAll("#inf-toks button").forEach(x => x.classList.toggle("on", +x.dataset.i === state.inf.pos));
-  inferView(); showTokenPaths(state.inf.pos);
+  inferView(); showTokenPaths(state.inf.pos); lightHeads(state.inf.pos);
 });
 document.querySelectorAll("#inf-sign button").forEach(b => b.onclick = () => {
   state.inf.sign = b.dataset.s;
@@ -348,6 +414,15 @@ function webSummaryHTML() {
     <div class="wsum"><div class="lab"><span class="sw up"></span>feeds → pushes toward · ${w.down.neurons} downstream neurons</div><div class="chips">${chips(w.down.toward)}</div></div>
     <div class="wsum"><div class="lab"><span class="sw down"></span>feeds → pushes away from</div><div class="chips">${chips(w.down.away)}</div></div>`;
 }
+// the open neuron's heads by role: later heads whose query, key or value reads it, and heads whose output it reads
+function nheadsHTML() {
+  const H = state.nheads, f = state.focus;
+  if (!H?.roles || !f || f.kind !== "neuron" || H.layer !== f.layer || H.n !== f.n) return "";
+  const name = x => `L${x.layer} h${x.heads.length > 1 ? `${x.heads[0]}–${x.heads.at(-1)}` : x.head}`;
+  const row = r => `<div class="lrow"><span class="sgn">${r}</span><div class="chips">${(H.roles[r] || []).filter(x => x.z >= 2).map(x =>
+    `<span class="chip" data-l="${x.layer}" data-h="${x.head}">${name(x)}<i>${x.z}</i></span>`).join("")}</div></div>`;
+  return `<div class="wsum"><div class="lab">heads</div>${["q", "k", "v", "o"].map(row).join("")}</div>`;
+}
 // the open neuron's own lenses (what it writes), above its web (what its cone does)
 function lensHTML() {
   const L = state.lens, f = state.focus;
@@ -358,8 +433,23 @@ function lensHTML() {
   return (L.steer_up ? `<div class="wsum"><div class="lab">steer lens · KL ${L.kl_up} / ${L.kl_down}</div>${pair(L.steer_up, L.steer_down)}</div>` : "")
     + `<div class="wsum"><div class="lab">logit lens</div>${pair(L.up, L.down)}</div>`;
 }
+// a head's strongest neurons in each role, as map links
+const ROLE_COL = { q: "#73ff8c", k: "#b399ff", v: "#66d9ff", o: "#66d9ff" };
+const headRoleLinks = h => [["q", h.q], ["k", h.k], ["v", h.reads], ["o", h.writes]]
+  .flatMap(([role, list]) => (list || []).slice(0, 5).map(c => ({ ...c, role, side: role === "o" ? "down" : "up" })));
+// the open head by role: the neurons feeding its query, key and value (earlier) and reading its output (later), each
+// with its own lens tokens
+function headHTML() {
+  const H = state.headInfo, f = state.focus;
+  if (!H || !f || f.kind !== "head" || H.layer !== f.layer || H.head !== f.n) return "";
+  const line = c => { const nm = state.unitMap[c.layer]?.get(c.n)?.name;
+    return `<div class="nline" data-nl="${c.layer}" data-nn="${c.n}"><span class="id">L${c.layer} N${c.n}</span>`
+      + `<span class="w">${nm ? `<b>${esc(nm)}</b> ` : ""}${esc((c.lens || []).slice(0, 4).map(t => t.trim() || t).join("  "))}</span><span class="z">${c.z.toFixed(0)}</span></div>`; };
+  const role = (r, list) => `<div class="wsum"><div class="lab"><span class="sw" style="background:${ROLE_COL[r]}"></span>${r}</div>${(list || []).slice(0, 10).map(line).join("")}</div>`;
+  return role("q", H.q) + role("k", H.k) + role("v", H.reads) + role("o", H.writes);
+}
 function renderList() {
-  $("#net").innerHTML = lensHTML() + webSummaryHTML();
+  $("#net").innerHTML = headHTML() || lensHTML() + webSummaryHTML() + nheadsHTML();
   if (lensResults) return renderResults(lensResults, $("#rows"));
   const q = $("#filter").value.trim().toLowerCase(), showR = $("#show-random").checked;
   const units = (state.units[state.layer] || []).filter(u => (showR || u.kind === "neuron") &&
@@ -380,9 +470,15 @@ function renderResults(r, ol) {
   const head = r.fires ? `${r.total ?? 0} neurons pass · score = activation ÷ its typical extreme` : `${r.total ?? 0} neurons · ${r.tokens ?? 0} tokens`;
   ol.innerHTML = `<li class="head">${head}</li>` + rows;
 }
+// a head chip marks its head on the map while hovered
+$("#net").addEventListener("mouseover", e => { const c = e.target.closest(".chip[data-h]"); map.hoverHead(c ? +c.dataset.l : null, c ? +c.dataset.h : null); });
+$("#net").addEventListener("mouseleave", () => map.hoverHead(null));
 // a web-summary token searches the lens for it
 $("#net").addEventListener("click", e => {
+  const nl = e.target.closest(".nline"); if (nl) return goToNeuron(+nl.dataset.nl, +nl.dataset.nn, "neuron");
   const chip = e.target.closest(".chip"); if (!chip) return;
+  if (chip.dataset.h) return openHead(+chip.dataset.l, +chip.dataset.h);
+
   if (state.qMode !== "lens") $('#q-mode button[data-q="lens"]').click();
   $("#lens-q").value = chip.dataset.q; $("#lens-q").dispatchEvent(new Event("input"));
 });
@@ -404,9 +500,24 @@ $("#jump").addEventListener("keydown", e => {
   if (m) openNeuron(+m[1], +m[2]);
 });
 addEventListener("hashchange", fromHash);
+// what's open is kept in this browser (a reload reopens it) and never in the address bar, where every neuron would
+// become a browser-history entry; a link with #L19/N7176 (a neuron) or #L19/h2 (an attention head) opens that
+function saveFocus() {
+  const f = state.focus;
+  try { localStorage.setItem("explorer.focus", JSON.stringify(f && (f.kind === "neuron" || f.kind === "head") ? f : null)); } catch {}
+}
+function restoreFocus() {
+  let f = null; try { f = JSON.parse(localStorage.getItem("explorer.focus") || "null"); } catch {}
+  if (!f) return;
+  if (f.kind === "head") openHead(f.layer, f.n); else openNeuron(f.layer, f.n, "neuron", false);
+}
 function fromHash() {
-  const m = location.hash.match(/^#L(\d+)\/N(\d+)/);
-  if (m && !(state.focus && state.focus.layer === +m[1] && state.focus.n === +m[2])) openNeuron(+m[1], +m[2], "neuron", false);
+  const m = location.hash.match(/^#L(\d+)\/(N|h)(\d+)/);
+  if (!m) return;
+  const kind = m[2] === "h" ? "head" : "neuron";
+  history.replaceState(null, "", location.pathname + location.search);  // the link is used up; later picks are remembered
+  if (isFocus(+m[1], +m[3], kind)) return;
+  if (kind === "head") openHead(+m[1], +m[3]); else openNeuron(+m[1], +m[3], "neuron", true);
 }
 
 // ---------- panel collapse ----------
@@ -431,7 +542,7 @@ function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f && f.kind !== "head" ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
@@ -442,8 +553,9 @@ $("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusColla
 const focusEl = $("#focus");
 // closing the neuron keeps the panel up when Claude is the open tab
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
+  map.selectHead(null); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; lightHeads(state.inf.pos);
   if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
-  setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
+  setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); saveFocus(); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
 const curTab = () => $("#tabs button.on")?.dataset.tab;
@@ -458,7 +570,7 @@ function setTab(t) {
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
 // neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
 function syncTabs() {
-  const f = state.focus;
+  const f = state.focus?.kind === "head" ? null : state.focus;
   for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
   tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
   if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
@@ -472,8 +584,9 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   flushName();
   if (running) running.abort();
   state.focus = { layer, n, kind };
+  map.selectHead(null); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; lightHeads(state.inf.pos);
   if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
-  if (push && kind === "neuron") history.replaceState(null, "", `#L${layer}/N${n}`);
+  if (push && kind === "neuron") saveFocus();
   focusEl.classList.add("on"); $("#list").classList.add("has-focus");
   setFocusCollapsed(false);
   $("#f-id").textContent = kind === "random" ? `L${layer} random ${n}` : `L${layer} N${n}`;
@@ -487,7 +600,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   if (!isFocus(layer, n, kind)) return;
   setNameField(state.unitMap[layer]?.get(n)?.name || "");
   renderList();
-  if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); }
+  if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); loadNeuronHeads(layer, n); }
   refreshWeb(); renderAgentActions();
   const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
   if (!isFocus(layer, n, kind)) return;
@@ -499,6 +612,42 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
   if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
   if (kind === "neuron") loadLive(layer, n);
+}
+// the heads linked to the open neuron light up on their slabs (see /api/neuron/heads)
+async function loadNeuronHeads(layer, n) {
+  state.nheads = null; lightHeads(tokHover ?? state.inf.pos);
+  const r = await api(`/api/neuron/heads?layer=${layer}&n=${n}`);
+  if (!isFocus(layer, n, "neuron")) return;
+  state.nheads = { ...r, layer, n }; lightHeads(tokHover ?? state.inf.pos); renderList(); renderConnections();
+  const want = Object.values(r.roles || {}).flat().filter(x => x.z >= 2 && !hoverCache.has(`h/${x.layer}/${x.head}`));
+  await Promise.all(want.map(async x => hoverCache.set(`h/${x.layer}/${x.head}`, await api(`/api/head?layer=${x.layer}&head=${x.head}`))));
+  if (isFocus(layer, n, "neuron")) renderConnections();
+  map.setNeuronHeads(roleHeads(r).slice(0, 8));
+}
+
+// a head opens in the list panel: its id up top, what it reads and writes in net, and on run the text shaded by
+// where it reads from; the neuron panel steps aside unless Claude is showing
+async function openHead(layer, head) {
+  if (!agentSelecting) clearAgentMarks();
+  flushName();
+  if (running) running.abort();
+  state.focus = { layer, n: head, kind: "head" };
+  saveFocus();
+  map.select(null); scatter.select(null, null); map.selectHead(layer, head);
+  $("#list").classList.add("has-focus");
+  if ($("#list").classList.contains("hidden")) setListHidden(false);
+  $("#f-id").textContent = `L${layer} h${head}`; $("#f-rank").textContent = "";
+  $("#f-name").style.display = "none";
+  if (curTab() === "claude") syncTabs(); else { focusEl.classList.remove("on"); syncTabs(); }
+  syncEdge(); updateInsets();
+  refreshWeb(); renderAgentActions();
+  shadeTokens(tokHover ?? state.inf.pos);
+  lightHeads(tokHover ?? state.inf.pos);
+  const r = await api(`/api/head?layer=${layer}&head=${head}`);
+  if (!isFocus(layer, head, "head")) return;
+  state.headInfo = r; hoverCache.set(`h/${layer}/${head}`, r);
+  map.setHeadLinks(layer, head, headRoleLinks(r));
+  renderList();
 }
 
 const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
@@ -581,14 +730,37 @@ function renderConnections() {
   };
   el.outerHTML = `<div id="d-con-wrap">
     <div class="lens"><div><div class="lab">writes into</div><table class="dtable">${state.con.down.slice(0, 14).map(row).join("")}</table></div>
-    <div><div class="lab">driven by</div><table class="dtable">${state.con.up.slice(0, 14).map(row).join("")}</table></div></div></div>`;
+    <div><div class="lab">driven by</div><table class="dtable">${state.con.up.slice(0, 14).map(row).join("")}</table></div></div>
+    ${headTablesHTML()}</div>`;
+}
+// the open neuron's heads in Details: later heads reading it (q / k / v) and heads it reads (o), each with what the
+// head writes (its o tokens) over what it carries (v tokens, faint)
+function headTablesHTML() {
+  const H = state.nheads, f = state.focus;
+  if (!H?.roles || !f || f.kind !== "neuron" || H.layer !== f.layer || H.n !== f.n) return "";
+  const tok = t => `<span class="tok">${esc(t.tok)}</span>`;
+  const row = x => {
+    const info = hoverCache.get(`h/${x.layer}/${x.head}`);
+    const id = `L${x.layer}·h${x.heads.length > 1 ? `${x.heads[0]}–${x.heads.at(-1)}` : x.head}`;
+    return `<tr class="con" data-hl="${x.layer}" data-hh="${x.head}"><td class="pole mono dim">${x.role}</td>
+      <td>${info ? info.write_toks.slice(0, 4).map(tok).join("") + `<div class="logit">${info.read_toks.slice(0, 4).map(tok).join("")}</div>` : ""}</td>
+      <td class="num dim">${x.z.toFixed(1)}</td><td class="mono faint">${id}</td></tr>`;
+  };
+  const rows = roles => roles.flatMap(r => (H.roles[r] || []).map(x => ({ ...x, role: r }))).filter(x => x.z >= 2).sort((a, b) => b.z - a.z);
+  return `<div class="lens"><div><div class="lab">heads reading it</div><table class="dtable">${rows(["q", "k", "v"]).slice(0, 10).map(row).join("")}</table></div>
+    <div><div class="lab">heads feeding it</div><table class="dtable">${rows(["o"]).slice(0, 10).map(row).join("")}</table></div></div>`;
 }
 // opening a neuron from a list or link also centres the camera on it
 function goToNeuron(layer, n, kind = "neuron") {
   openNeuron(layer, n, kind, true, false);
   if (kind === "neuron") map.focusNeuron(layer, n);
 }
-$("#tab-details").addEventListener("click", e => { const tr = e.target.closest("tr[data-l]"); if (tr) goToNeuron(+tr.dataset.l, +tr.dataset.n); });
+$("#tab-details").addEventListener("click", e => {
+  const th = e.target.closest("tr[data-hl]"); if (th) return openHead(+th.dataset.hl, +th.dataset.hh);
+  const tr = e.target.closest("tr[data-l]"); if (tr) goToNeuron(+tr.dataset.l, +tr.dataset.n);
+});
+$("#tab-details").addEventListener("mouseover", e => { const th = e.target.closest("tr[data-hl]"); map.hoverHead(th ? +th.dataset.hl : null, th ? +th.dataset.hh : null); });
+$("#tab-details").addEventListener("mouseleave", () => map.hoverHead(null));
 
 // name autosave
 let nameTimer, pendingName = null;
@@ -742,10 +914,10 @@ const have = Object.keys(index.layers).map(Number);
 let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== null) saved = +v; } catch {}
 const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
 await setLayer(first);
-if (location.hash) fromHash();
+if (location.hash) fromHash(); else restoreFocus();
 
 // ---------- claude: the Claude tab, one claude -p session per conversation ----------
-const agent = { chat: null, ctl: null };
+const agent = { chat: null, kind: "claude", busy: false, sending: 0, box: null, seg: null, segText: "", reply: "", waiters: [] };
 const agentEl = $("#tab-claude");
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
@@ -767,13 +939,25 @@ const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a 
 // the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
 const AGENT_KEY = "explorer.agent";
 function saveAgent() {
-  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
+  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, kind: agent.kind, html: $("#a-thread").innerHTML })); } catch {}
 }
+// which agent the chat runs on: the tab is named after it, and the dropdown picks it for the next new chat
+function setAgentKind(kind) {
+  agent.kind = kind === "codex" ? "codex" : "claude";
+  $("#a-agent").value = agent.kind;
+  $('#tabs button[data-tab="claude"]').textContent = agent.kind === "codex" ? "Codex" : "Claude";
+}
+$("#a-agent").addEventListener("change", e => {
+  const kind = e.target.value;
+  try { localStorage.setItem("explorer.agentKind", kind); } catch {}
+  if (agent.chat || $("#a-thread .a-msg")) { pastStash = null; $("#a-past").classList.remove("on"); resetAgent(); clearAgentMarks(); }
+  setAgentKind(kind);
+});
 function loadAgent() {
   try {
     const v = JSON.parse(localStorage.getItem(AGENT_KEY) || "null"); if (!v) return;
-    agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY;
-    $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy").forEach(b => b.remove());
+    agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY; setAgentKind(v.kind);
+    $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy, .a-qctl").forEach(b => b.remove());
     $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
     addTurnControls();
   } catch {}
@@ -781,16 +965,19 @@ function loadAgent() {
 // quick actions above the input, for the open neuron
 function renderAgentActions() {
   const f = state.focus;
-  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">what does its web do?</button>` : "";
+  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">what does its web do?</button>`
+    : f && f.kind === "head" ? `<button data-a="explain">explain L${f.layer} h${f.n}</button>` : "";
 }
 $("#a-actions").addEventListener("click", e => {
-  const b = e.target.closest("button"); if (!b || agent.ctl) return;
+  const b = e.target.closest("button"); if (!b || agent.busy) return;
   if (b.dataset.a === "explain") explainFocus();
   else if (b.dataset.a === "web") { const f = state.focus; agentTurn(`Look at the cone of L${f.layer} N${f.n} (what it reads from and writes into, a few hops out) and tell me briefly what that circuit seems to do. Highlight the neurons you mention.`, `what does the web of L${f.layer} N${f.n} do?`); }
 });
 function resetAgent() {
-  if (agent.ctl) agent.ctl.abort();
+  closeEvents(); if (agent.busy) finishTurn();
   agent.chat = null; $("#a-thread").innerHTML = EMPTY;
+  let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {}
+  setAgentKind(pref);
   saveAgent();
 }
 agentEl.addEventListener("click", e => {
@@ -803,7 +990,10 @@ function clearAgentMarks() {
   if (agentMarked) { agentMarked = false; syncLeftMap(); }
 }
 async function agentUi(e) {
-  if (e.action === "select") {  // visibly go there
+  if (e.action === "head") {
+    agentSelecting = true;
+    try { await openHead(e.layer, e.head); } finally { agentSelecting = false; }
+  } else if (e.action === "select") {  // visibly go there
     agentSelecting = true;
     try { await openNeuron(e.layer, e.n, "neuron", true, false); } finally { agentSelecting = false; }
     map.flyToNeuron(e.layer, e.n, 0.3);
@@ -858,61 +1048,149 @@ function addMsg(cls, html) {
   th.scrollTop = th.scrollHeight; return d;
 }
 // one turn: the reply streams into a new assistant message, text and tool calls interleaved in the order they happen
+// ---- the chat: one claude process per chat on the server and one event stream here. Messages go in any time:
+// mid-reply they reach Claude between tool calls. Stop ends the reply only; background work keeps running and
+// reports back in a turn of its own, which renders like any other. ----
+function ensureChatId() { if (!agent.chat) agent.chat = crypto.randomUUID(); return agent.chat; }
+let evCtl = null, evChat = null;
+async function openEvents() {
+  const chat = agent.chat; if (!chat || (evCtl && evChat === chat)) return;
+  if (evCtl) evCtl.abort();
+  const ctl = evCtl = new AbortController(); evChat = chat;
+  while (!ctl.signal.aborted) {
+    try {
+      const r = await fetch(`/api/agent/events?chat=${encodeURIComponent(chat)}`, { signal: ctl.signal });
+      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { value, done } = await rd.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (line && evCtl === ctl) onAgentEvent(JSON.parse(line));
+        }
+      }
+    } catch { if (ctl.signal.aborted) return; }
+    await new Promise(r => setTimeout(r, 1500));  // reconnect (server restarts); its state event settles a turn that ended meanwhile
+  }
+}
+function closeEvents() { if (evCtl) evCtl.abort(); evCtl = evChat = null; }
+// the reply box under the latest message; its "thinking…" line moves with it
+function replyBox() {
+  if (agent.box) return agent.box;
+  $("#a-thread").querySelectorAll(".a-busy").forEach(x => x.remove());
+  $("#a-thread").querySelectorAll(".a-msg.assistant:empty").forEach(x => x.remove());  // a reply that moved under a newer message
+  const box = agent.box = addMsg("assistant", "");
+  agent.seg = null;
+  if (agent.busy) { const busy = document.createElement("div"); busy.className = "a-busy"; box.append(busy); }
+  return box;
+}
+const putInBox = el => { const box = replyBox(), busy = box.querySelector(".a-busy"); busy ? box.insertBefore(el, busy) : box.append(el); };
+function setBusy(b) { agent.busy = b; setSendMode(b); }
+function onAgentEvent(e) {
+  const th = $("#a-thread"), stick = th.scrollHeight - th.scrollTop - th.clientHeight < 80;
+  if (e.t === "state") {
+    // (re)connected: the turn in progress replays from its start, so what was drawn of it is drawn again
+    if (agent.box && e.busy) { agent.box.innerHTML = ""; agent.seg = null; agent.reply = ""; }
+    if (e.busy) { setBusy(true); replyBox(); if (!agent.box.querySelector(".a-busy")) { const d = document.createElement("div"); d.className = "a-busy"; agent.box.append(d); } }
+    else if (agent.busy && !agent.sending) finishTurn();  // a message still on its way makes the server busy in a moment
+    return;
+  }
+  if (e.t === "ping" || e.t === "sent") return;
+  if (e.t === "ui") return agentUi(e);
+  if (e.t === "done") return finishTurn();
+  if (!agent.busy) { setBusy(true); clearTurnControls(); }  // a turn Claude started itself (background work finished)
+  if (e.t === "text") {
+    if (!agent.seg) { agent.seg = document.createElement("div"); agent.seg.className = "a-md"; agent.segText = ""; putInBox(agent.seg); }
+    agent.segText += e.text; agent.reply += e.text; agent.seg.innerHTML = md(agent.segText);
+  } else if (e.t === "tool") { agent.seg = null; putInBox(toolDetails(e)); }
+  else if (e.t === "tool_result") { if (agent.box) fillTool(agent.box, e); }
+  else if (e.t === "error") { const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; putInBox(d); }
+  if (stick) th.scrollTop = th.scrollHeight;
+}
+function finishTurn() {
+  const box = agent.box, reply = agent.reply;
+  $("#a-thread").querySelectorAll(".a-busy").forEach(x => x.remove());
+  agent.box = agent.seg = null; agent.reply = "";
+  setBusy(false); addTurnControls(); markFresh("claude"); saveAgent();
+  for (const w of agent.waiters.splice(0)) w({ reply, box });
+}
 async function agentTurn(message, shown, shownCls = "user", atts = []) {
-  if (agent.ctl) agent.ctl.abort();
-  const ctl = agent.ctl = new AbortController(), f = state.focus, th = $("#a-thread");
+  const f = state.focus, th = $("#a-thread");
+  if (pastStash !== null) { th.innerHTML = pastStash; pastStash = null; $("#a-past").classList.remove("on"); }
   clearAgentMarks(); clearTurnControls();
   const ub = addMsg(shownCls, esc(shown) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : ""));
   ub.dataset.msg = message; ub.dataset.shown = shown; ub.dataset.cls = shownCls; ub.dataset.att = JSON.stringify(atts);
-  const box = addMsg("assistant", "");
-  let seg = null, segText = "", reply = "";
-  const busy = document.createElement("div"); busy.className = "a-busy"; box.append(busy);
-  const stick = () => { th.scrollTop = th.scrollHeight; };
-  setSendMode(true);
+  agent.box = agent.seg = null;  // the reply, or the rest of the one in progress, goes under this message
+  ensureChatId(); openEvents();
+  setBusy(true); replyBox(); th.scrollTop = th.scrollHeight; saveAgent();
+  const out = new Promise(res => agent.waiters.push(res));
+  agent.sending++;
   try {
-    const body = { chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
-    const r = await fetch("/api/agent/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal });
-    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-    for (;;) {
-      const { value, done } = await rd.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line) continue;
-        const e = JSON.parse(line);
-        if (e.t === "chat") agent.chat = e.chat;
-        else if (e.t === "text") {
-          if (!seg) { seg = document.createElement("div"); seg.className = "a-md"; box.insertBefore(seg, busy); segText = ""; }
-          segText += e.text; reply += e.text; seg.innerHTML = md(segText);
-        } else if (e.t === "tool") {
-          // expandable: the call's arguments, then its (truncated) output once it arrives
-          seg = null;
-          const d = document.createElement("details"); d.className = "a-tool"; if (e.id) d.dataset.id = e.id;
-          d.innerHTML = `<summary>${esc(toolLabel(e.name, e.input || {}))}</summary><pre class="a-io"><b>${esc(e.name)}</b> ${esc(JSON.stringify(e.input || {}, null, 1))}</pre><pre class="a-io out">running…</pre>`;
-          box.insertBefore(d, busy);
-        } else if (e.t === "tool_result") {
-          const d = [...box.querySelectorAll("details.a-tool")].find(x => x.dataset.id === e.id);
-          if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); }
-        } else if (e.t === "ui") agentUi(e);
-        else if (e.t === "error") { const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; box.insertBefore(d, busy); }
-        stick();
-      }
-    }
+    const r = await api("/api/agent/send", { chat: agent.chat, agent: agent.kind, message, attachments: atts.map(a => a.id),
+      ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : f && f.kind === "head" ? { layer: f.layer, head: f.n } : {}) });
+    if (r.error) throw new Error(r.error);
   } catch (err) {
-    const d = document.createElement("div"); d.className = err.name === "AbortError" ? "a-stopped" : "a-err";
-    d.textContent = err.name === "AbortError" ? "stopped" : String(err); box.append(d);
-  } finally {
-    busy.remove();
-    if (agent.ctl === ctl) {
-      agent.ctl = null; setSendMode(false); addTurnControls(); markFresh("claude");
-      if (!ctl.signal.aborted && agent.queue.length) flushQueue();
-    }
-    saveAgent();
-  }
-  return { reply, box };
+    const d = document.createElement("div"); d.className = "a-err"; d.textContent = String(err.message || err); putInBox(d); finishTurn();
+  } finally { agent.sending--; }
+  return out;
 }
+async function stopAgent() {
+  if (!agent.busy) return;
+  const d = document.createElement("div"); d.className = "a-stopped"; d.textContent = "stopped"; putInBox(d);
+  const r = agent.chat ? await api("/api/agent/interrupt", { chat: agent.chat }).catch(() => ({})) : {};
+  if (!r.running && agent.busy) finishTurn();  // nothing running server side: settle here
+}
+function toolDetails(e) {
+  const d = document.createElement("details"); d.className = "a-tool"; if (e.id) d.dataset.id = e.id;
+  d.innerHTML = `<summary>${esc(toolLabel(e.name, e.input || {}))}</summary><pre class="a-io"><b>${esc(e.name)}</b> ${esc(JSON.stringify(e.input || {}, null, 1))}</pre><pre class="a-io out">running…</pre>`;
+  return d;
+}
+function fillTool(box, e) {
+  const d = [...box.querySelectorAll("details.a-tool")].find(x => x.dataset.id === e.id);
+  if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); }
+}
+// ---- past chats: "past" lists the sessions on disk; picking one rebuilds its thread and later turns resume it ----
+let pastStash = null;  // the thread shown before the list opened
+const ago = t => { const s = Date.now() / 1000 - t; return s < 3600 ? `${Math.max(1, Math.round(s / 60))}m ago` : s < 86400 ? `${Math.round(s / 3600)}h ago` : new Date(t * 1000).toLocaleDateString(); };
+async function togglePast() {
+  const th = $("#a-thread");
+  if (pastStash !== null) { th.innerHTML = pastStash; pastStash = null; $("#a-past").classList.remove("on"); addTurnControls(); return; }
+  pastStash = th.innerHTML; $("#a-past").classList.add("on");
+  th.innerHTML = `<div class="dim">…</div>`;
+  const list = await api("/api/agent/chats");
+  if (pastStash === null) return;
+  th.innerHTML = list.length ? list.map(c => `<button class="a-pastrow${c.chat === agent.chat ? " on" : ""}" data-chat="${c.chat}" data-agent="${c.agent || "claude"}"><span class="t">${esc(c.title || "—")}</span><span class="m">${c.agent === "codex" ? "codex · " : ""}${ago(c.t)} · ${c.turns} message${c.turns === 1 ? "" : "s"}</span></button>`).join("")
+    : `<div class="dim">—</div>`;
+}
+async function openPast(chat, kind) {
+  const r = await api(`/api/agent/history?chat=${encodeURIComponent(chat)}`);
+  pastStash = null; $("#a-past").classList.remove("on");
+  const th = $("#a-thread"); th.innerHTML = EMPTY;
+  let box = null, seg = null, segText = "";
+  for (const e of r.events || []) {
+    if (e.t === "user") {
+      const ub = addMsg("user", esc(e.text));
+      Object.assign(ub.dataset, { msg: e.text, shown: e.text, cls: "user", att: "[]" });
+      box = seg = null; continue;
+    }
+    if (!box) { box = addMsg("assistant", ""); seg = null; }
+    if (e.t === "text") {
+      if (!seg) { seg = document.createElement("div"); seg.className = "a-md"; box.append(seg); segText = ""; }
+      segText += (segText ? "\n\n" : "") + e.text; seg.innerHTML = md(segText);
+    } else if (e.t === "tool") { seg = null; box.append(toolDetails(e)); }
+    else if (e.t === "tool_result") fillTool(box, e);
+    else if (e.t === "error") { seg = null; const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; box.append(d); }
+  }
+  closeEvents(); if (agent.busy) { agent.box = null; finishTurn(); }
+  agent.chat = chat; setAgentKind(kind); clearAgentMarks(); addTurnControls(); saveAgent(); openEvents();
+  th.scrollTop = th.scrollHeight;
+}
+$("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-pastrow"); if (b) openPast(b.dataset.chat, b.dataset.agent); });
 async function explainFocus() {
-  const f = state.focus; if (!f || f.kind !== "neuron") return;
+  const f = state.focus; if (!f) return;
+  if (f.kind === "head") return agentTurn(`Explain attention head L${f.layer} h${f.n}: write the head report.`, `explain L${f.layer} h${f.n}`);
+  if (f.kind !== "neuron") return;
   const { reply, box } = await agentTurn(`Explain L${f.layer} N${f.n}: write the autointerp report.`, `explain L${f.layer} N${f.n}`);
   const name = reply.match(/\*\*Name\*\*:?\s*(.+)/)?.[1].replace(/[*`]/g, "").trim();
   if (name) {
@@ -926,36 +1204,13 @@ function sendChat() {
   if (agent.pending.some(a => !a.id) || (!msg && !agent.pending.length)) return false;
   const atts = agent.pending; agent.pending = []; renderPending();
   $("#a-input").value = ""; growInput();
-  if (agent.ctl) { queueMessage(msg || "(see the attached files)", atts); return true; }  // busy: it goes after this reply
   agentTurn(msg || "(see the attached files)", msg || "(attached files)", "user", atts);
   return true;
 }
-
-// ---- stop / queue / interrupt: while Claude works, the send button stops it and new messages queue behind it ----
-agent.queue = [];
 function setSendMode(busy) {
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
   b.textContent = busy ? "■" : "↑"; b.title = busy ? "stop" : "send"; b.setAttribute("aria-label", busy ? "stop" : "send");
 }
-function stopAgent() { if (agent.ctl) agent.ctl.abort(); }
-function queueMessage(msg, atts) {
-  const q = { msg, atts }; agent.queue.push(q);
-  const d = addMsg("user queued", esc(msg) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : "")
-    + `<div class="a-qctl"><span>queued</span><button data-q="now">send now</button><button data-q="drop">×</button></div>`);
-  q.el = d;
-}
-function flushQueue() {
-  const q = agent.queue.splice(0); if (!q.length) return;
-  for (const x of q) x.el?.remove();
-  const msg = q.map(x => x.msg).join("\n\n"), atts = q.flatMap(x => x.atts);
-  agentTurn(msg, msg, "user", atts);
-}
-$("#a-thread").addEventListener("click", e => {
-  const b = e.target.closest(".a-qctl button"); if (!b) return;
-  const el = b.closest(".a-msg"), i = agent.queue.findIndex(x => x.el === el);
-  if (b.dataset.q === "drop") { if (i >= 0) agent.queue.splice(i, 1); el.remove(); return; }
-  stopAgent(); setTimeout(flushQueue, 50);  // interrupt: stop the reply, then send what's queued now
-});
 
 // ---- attachments: picked, dropped or pasted files upload right away and go with the next message ----
 agent.pending = [];
@@ -1000,7 +1255,7 @@ function addTurnControls() {
 }
 async function rewindLast(act) {
   const t = lastTurn(); if (!t) return;
-  if (agent.ctl) agent.ctl.abort();
+  if (agent.busy) { agent.box = null; finishTurn(); }
   const u = t.u, msg = u.dataset.msg ?? u.childNodes[0]?.textContent ?? "", shown = u.dataset.shown ?? msg;
   const cls = u.dataset.cls || "user", atts = JSON.parse(u.dataset.att || "[]");
   if (agent.chat) { try { await api("/api/agent/rewind", { chat: agent.chat, text: msg }); } catch {} }
@@ -1012,15 +1267,16 @@ async function rewindLast(act) {
 $("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-ctl button"); if (b) rewindLast(b.dataset.act); });
 function growInput() { const t = $("#a-input"); t.style.height = "auto"; t.style.height = `${Math.min(200, t.scrollHeight)}px`; }
 $("#a-input").addEventListener("input", growInput);
-// Enter sends; while Claude works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
+// Enter sends, also while Claude works: the message reaches it between tool calls
 $("#a-input").addEventListener("keydown", e => {
   if (e.key !== "Enter" || e.shiftKey) return;
   e.preventDefault();
-  if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) { stopAgent(); setTimeout(flushQueue, 50); } }
-  else sendChat();
+  sendChat();
 });
-// the button sends, or stops while Claude works (Enter still sends, which queues while it works)
-$("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl) stopAgent(); else sendChat(); });
-$("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
-loadAgent(); renderAgentActions();
+// the button sends, or stops the reply while Claude works (Enter always sends: mid-reply the message goes straight in)
+$("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.busy) stopAgent(); else sendChat(); });
+$("#a-new").onclick = () => { pastStash = null; $("#a-past").classList.remove("on"); resetAgent(); clearAgentMarks(); };
+$("#a-past").onclick = togglePast;
+{ let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {} setAgentKind(pref); }
+loadAgent(); renderAgentActions(); openEvents();
 syncEdge(); updateInsets();

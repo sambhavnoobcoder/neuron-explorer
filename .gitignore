@@ -24,3 +24,9 @@ explorer/*.local.md
 
 # per-machine pod settings
 sweep/pod_template.json
+
+# rebuilt on first use
+explorer/cache/head_profiles.json
+
+# experiment scripts
+scripts/

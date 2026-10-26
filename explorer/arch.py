@@ -8,7 +8,7 @@ output before adding it to the residual stream (Gemma 2/3, OLMo 2).
 
 Covered: dense decoder-only models with a gated MLP (Llama, Mistral, Qwen 2/2.5/3/3.5, Gemma 1/2/3, SmolLM, OLMo,
 Granite, Phi-3/4 with a fused gate_up_proj, ...) or a plain one (GPT-2, GPT-NeoX/Pythia, Phi-1/2, ...). Mixture-of-
-experts MLPs are refused. `python scripts/check_model.py --model <id>` checks a model against every assumption here.
+experts MLPs are refused. `python explorer/check_model.py --model <id>` checks a model against every assumption here.
 """
 import os
 
@@ -100,6 +100,11 @@ def describe(model_name, tok=None):
 def _weight(mod):
     """A projection's weight as [out, in], whatever the layer type (GPT-2's Conv1D stores [in, out])."""
     return mod.weight.T if type(mod).__name__ == "Conv1D" else mod.weight
+
+
+def norm_eps(norm):
+    """The epsilon a norm adds under its square root (RMSNorm's variance_epsilon or eps, LayerNorm's eps)."""
+    return next((float(v) for k in ("variance_epsilon", "eps", "epsilon") if isinstance(v := getattr(norm, k, None), (int, float))), 1e-6)
 
 
 def _first_tensor(args, kwargs):
@@ -299,6 +304,9 @@ class Arch:
     pre_norms[l]         the norm whose output is the MLP's input (None: the MLP reads the raw residual, as in OLMo 2)
     post_norms[l]        the norm applied to the MLP's output before the residual add (None on most models)
     attn[l]              (name, output projection, head count) of the token mixer
+    attn_pre_norms[l]    the norm whose output is the attention's input; attn_post_norms[l]: the norm on its output
+                         before the residual add (Gemma 2/3, OLMo 2)
+    parallel[l]          attention and MLP read the same residual (GPT-NeoX, Phi-2): the MLP doesn't see this layer's heads
     final_norm, head     the norm in front of the unembedding, and the unembedding
     """
 
@@ -320,11 +328,15 @@ class Arch:
         self.n_vocab = len(tok) if tok is not None else _weight(self.head).shape[0]
         self.pre_norms = [None] * self.n_layers
         self.post_norms = [None] * self.n_layers
+        self.attn_pre_norms = [None] * self.n_layers
+        self.attn_post_norms = [None] * self.n_layers
+        self.parallel = [False] * self.n_layers
         self.final_norm = None
         self.traced = False
         if trace:
             self._trace()
         self._scales = {}
+        self._parts = {}
 
     # ---------- discovery by tracing ----------
     def _trace(self):
@@ -351,6 +363,11 @@ class Arch:
                 if id(m) not in inside and "norm" in type(m).__name__.lower():
                     hooks.append(m.register_forward_hook(norm_hook(("norm", l), name), with_kwargs=True))
             hooks.append(mlp.module.register_forward_hook(mlp_hook(l), with_kwargs=True))
+            if self.attn[l][0] is not None:
+                hooks.append(getattr(layer, self.attn[l][0]).register_forward_hook(
+                    lambda mod, args, kwargs, out, l=l: rec.__setitem__(
+                        ("attn", l), (_first_tensor(args, kwargs), out[0] if isinstance(out, tuple) else out)),
+                    with_kwargs=True))
         for name, m in self.lm.named_modules():
             if id(m) not in in_layers and "norm" in type(m).__name__.lower():
                 hooks.append(m.register_forward_hook(norm_hook("final", name), with_kwargs=True))
@@ -369,6 +386,12 @@ class Arch:
             norms = rec.get(("norm", l), [])
             self.pre_norms[l] = next((m for _, m, _, o in norms if _same(o, x_in)), None)
             self.post_norms[l] = next((m for _, m, i, _ in norms if _same(i, x_out)), None)
+            a_in, a_out = rec.get(("attn", l), (None, None))
+            self.attn_pre_norms[l] = next((m for _, m, _, o in norms if _same(o, a_in)), None)
+            self.attn_post_norms[l] = next((m for _, m, i, _ in norms if _same(i, a_out)), None)
+            # what each block reads before its norm: the same tensor means attention and MLP run side by side
+            src = lambda norm, x: next((i for _, m, i, _ in norms if m is norm), None) if norm is not None else x
+            self.parallel[l] = a_in is not None and _same(src(self.pre_norms[l], x_in), src(self.attn_pre_norms[l], a_in))
         self.final_norm = next((m for _, m, _, o in rec.get("final", []) if _same(o, rec.get("head_in"))), None)
         if self.final_norm is None:  # something between the norm and the head (a scale); the lens ignores it
             self.final_norm = next((getattr(self.lm, n) for n in ("norm", "final_layernorm", "final_layer_norm",
@@ -384,12 +407,30 @@ class Arch:
             return torch.ones(self.hidden, device=dev)
         if id(norm) not in self._scales:
             p = next((t for t in norm.parameters()), self.head.weight)
-            e = torch.ones(self.hidden, device=dev, dtype=p.dtype)
-            e[1::2] = -1
-            with torch.inference_mode():
-                d = norm(e[None, None]).float() - norm(-e[None, None]).float()
+            # a float32 probe keeps the scale exact on bfloat16 models (RMSNorms compute in float32 anyway); a norm
+            # that insists on its own dtype (torch's LayerNorm) gets the probe in that dtype
+            for dt in (torch.float32, p.dtype):
+                e = torch.ones(self.hidden, device=dev, dtype=dt)
+                e[1::2] = -1
+                try:
+                    with torch.inference_mode():
+                        d = norm(e[None, None]).float() - norm(-e[None, None]).float()
+                    break
+                except RuntimeError:
+                    continue
             self._scales[id(norm)] = (d[0, 0] / (2 * e.float())).clone()
         return self._scales[id(norm)]
+
+    def norm_centred(self, norm):
+        """Whether a norm subtracts the mean first (LayerNorm) rather than only dividing by the rms (RMSNorm), read off
+        the module: a centring norm maps a constant vector and its negative to the same output."""
+        key = ("centred", id(norm))
+        if key not in self._scales:
+            p = next((t for t in norm.parameters()), self.head.weight)
+            e = torch.ones(1, 1, self.hidden, device=self.head.weight.device, dtype=p.dtype)
+            with torch.inference_mode():
+                self._scales[key] = bool(torch.allclose(norm(e).float(), norm(-e).float(), atol=1e-4))
+        return self._scales[key]
 
     def pre_scale(self, l):
         """[hidden] float: what the MLP of layer l multiplies a residual direction by before its gate and up rows."""
@@ -403,6 +444,32 @@ class Arch:
         if self.post_norms[l] is None:
             return w
         return w * self.norm_scale(self.post_norms[l]).to(w.dtype)[:, None]
+
+    # ---------- attention heads ----------
+    def attn_kind(self, l):
+        """"softmax" (full or sliding-window attention whose queries, keys and values the capture sees), "deltanet"
+        (Gated DeltaNet linear attention, Qwen3.5 / Qwen3-Next), or None: head patterns and links are off there."""
+        p = self.attn_parts(l)
+        return p.kind if p is not None else None
+
+    def attn_parts(self, l):
+        """Layer l's attention cut into heads (AttnParts), or None for a layout this code doesn't know."""
+        if l not in self._parts:
+            name, out, n = self.attn[l]
+            mod = getattr(self.layers[l], name) if name else None
+            try:
+                self._parts[l] = AttnParts.of(mod, out, n) if mod is not None and out is not None and n else None
+            except (RuntimeError, ValueError, AttributeError):  # weights that don't split the way a known layout does
+                self._parts[l] = None
+        return self._parts[l]
+
+    def attn_pre_scale(self, l):
+        """[hidden] float: the per-channel scale of the norm in front of layer l's attention."""
+        return self.norm_scale(self.attn_pre_norms[l])
+
+    def attn_post_scale(self, l):
+        """[hidden] float: the per-channel scale of the norm on layer l's attention output (ones when there is none)."""
+        return self.norm_scale(self.attn_post_norms[l])
 
     def logits(self, x):
         """Unembed residual-stream vectors x [..., hidden] through the final norm, as the logit lens reads them. Cut to
@@ -446,4 +513,104 @@ class Arch:
             "post_mlp_norm": self.post_mlp_norm if self.traced else any(
                 "post_feedforward" in name or "post_mlp" in name for name, _ in self.layers[0].named_modules()),
             "vocab": self.n_vocab,
+            "attn_kinds": [self.attn_kind(l) for l in range(self.n_layers)],  # softmax / deltanet / None (no head tools)
         }
+
+
+class AttnParts:
+    """One layer's attention cut into heads, from its weights (each [rows, hidden] or [hidden, cols], before any norm
+    scale). Output heads h = 0..n-1 each have a value slice and an output slice; queries and keys come in groups that
+    several heads share (grouped-query attention; Gated DeltaNet's key heads).
+
+    kind      "softmax" or "deltanet"
+    q, k, v   [units, dim, hidden]: query and key units, value units
+    out       [hidden, n, dim]: the output projection's columns per head
+    o_scale   [dim] or None: a per-channel weight between the head and the output projection (DeltaNet's gated norm)
+    gated     softmax heads whose output is multiplied by a sigmoid gate from the query projection (Qwen3.5)
+    """
+
+    def __init__(self, kind, n, q, k, v, out, q_of, k_of, v_of, gated=False, o_scale=None, q_proj=None):
+        self.kind, self.n, self.q, self.k, self.v, self.out = kind, n, q, k, v, out
+        self.q_of, self.k_of, self.v_of = q_of, k_of, v_of  # output head -> its query / key / value unit
+        self.gated, self.o_scale, self.q_proj = gated, o_scale, q_proj
+
+    def heads_of(self, role, unit):
+        """The output heads that share query / key / value unit `unit`."""
+        f = {"q": self.q_of, "k": self.k_of, "v": self.v_of}[role]
+        return [h for h in range(self.n) if f(h) == unit]
+
+    @classmethod
+    def of(cls, mod, out_proj, n):
+        W_out = _weight(out_proj)  # [hidden, n * dim]
+        H = W_out.shape[0]
+        if all(hasattr(mod, x) for x in ("in_proj_qkv", "A_log", "conv1d")):  # Gated DeltaNet
+            nk, kd, vd = mod.num_k_heads, mod.head_k_dim, mod.head_v_dim
+            W = _weight(mod.in_proj_qkv)
+            rep = n // nk
+            return cls("deltanet", n, W[: nk * kd].view(nk, kd, H), W[nk * kd: 2 * nk * kd].view(nk, kd, H),
+                       W[2 * nk * kd:].view(n, vd, H), W_out.view(H, n, vd), q_of=lambda h: h // rep,
+                       k_of=lambda h: h // rep, v_of=lambda h: h, o_scale=mod.norm.weight)
+        vd = W_out.shape[1] // n
+        hd = next((d for d in (getattr(mod, "head_dim", None), getattr(mod, "head_size", None)) if isinstance(d, int)), vd)
+        gated, q_proj = False, None
+        if all(isinstance(getattr(mod, x, None), torch.nn.Module) for x in ("q_proj", "k_proj", "v_proj")):
+            Wq, Wk, Wv = (_weight(getattr(mod, x)) for x in ("q_proj", "k_proj", "v_proj"))
+            nkv = Wk.shape[0] // hd
+            if Wq.shape[0] == 2 * n * hd:  # each head's query followed by its output gate (Qwen3.5)
+                q, gated, q_proj = Wq.view(n, 2 * hd, H)[:, :hd], True, mod.q_proj
+            elif Wq.shape[0] == n * hd:
+                q = Wq.view(n, hd, H)
+            else:
+                return None
+            k, v = Wk.view(nkv, hd, H), Wv.view(nkv, Wv.shape[0] // nkv, H)
+        elif isinstance(getattr(mod, "qkv_proj", None), torch.nn.Module):  # Phi-3: q, then k, then v
+            W = _weight(mod.qkv_proj)
+            nkv = (W.shape[0] - n * hd) // (2 * hd)
+            q, k, v = W[: n * hd].view(n, hd, H), W[n * hd: (n + nkv) * hd].view(nkv, hd, H), W[(n + nkv) * hd:].view(nkv, hd, H)
+        elif isinstance(getattr(mod, "c_attn", None), torch.nn.Module):  # GPT-2: q, k, v thirds
+            W = _weight(mod.c_attn)
+            nkv = n
+            q, k, v = (x.reshape(n, hd, H) for x in W.chunk(3, 0))
+        elif isinstance(getattr(mod, "query_key_value", None), torch.nn.Module) and "neox" in type(mod).__name__.lower():
+            W = _weight(mod.query_key_value).view(n, 3, hd, H)  # GPT-NeoX: per head, q k v
+            nkv = n
+            q, k, v = W[:, 0], W[:, 1], W[:, 2]
+        else:
+            return None
+        if n % nkv or k.shape[1] != q.shape[1]:
+            return None
+        rep = n // nkv
+        return cls("softmax", n, q, k, v, W_out.view(H, n, vd), q_of=lambda h: h, k_of=lambda h: h // rep,
+                   v_of=lambda h: h // rep, gated=gated, q_proj=q_proj)
+
+
+# id(attention module) -> the dict its attention call fills while a head capture runs (install_capture)
+CAPTURE = {}
+
+
+def _capturing(fn):
+    def attn(module, query, key, value, attention_mask, *args, **kwargs):
+        c = CAPTURE.get(id(module))
+        if c is not None:  # [batch, heads, T, dim]: the queries, keys and values the softmax uses, after rotary
+            c.update(q=query[0], k=key[0], v=value[0], scaling=kwargs.get("scaling"), softcap=kwargs.get("softcap"),
+                     window=kwargs.get("sliding_window"))
+        return fn(module, query, key, value, attention_mask, *args, **kwargs)
+    attn._explorer = True
+    return attn
+
+
+def install_capture(model):
+    """Wraps the attention functions transformers dispatches to (the registered ones, and each model file's own eager
+    function, which is used when "eager" is picked) so a capture can see the queries, keys and values a softmax head
+    attends with: exactly the model's, with its norms, rotary embedding, scale, softcap and sliding window. Calls pass
+    through unchanged; idempotent."""
+    import sys
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as REG
+    for key in REG.valid_keys():
+        if not getattr(REG[key], "_explorer", False):
+            REG[key] = _capturing(REG[key])
+    for m in model.modules():
+        mod = sys.modules.get(type(m).__module__)
+        fn = getattr(mod, "eager_attention_forward", None)
+        if fn is not None and not getattr(fn, "_explorer", False):
+            mod.eager_attention_forward = _capturing(fn)

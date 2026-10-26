@@ -10,10 +10,12 @@ caps how far any push can move the residual stream.
 import json
 import os
 import sqlite3
+import sys
 import threading
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 import arch as A
@@ -45,6 +47,16 @@ def fits(arr, shape, what):
     return False
 
 
+def _locked(f):
+    """Runs a method entirely under the model lock, so its GPU temporaries are created and freed while no other
+    thread is using the GPU (MPS fails when two threads' work interleaves)."""
+    def g(self, *a, **k):
+        with self.lock:
+            return f(self, *a, **k)
+    g.__doc__, g.__name__ = f.__doc__, f.__name__
+    return g
+
+
 class Runtime:
     def __init__(self, stats_dir, shape=None):
         self.stats_dir = stats_dir
@@ -56,7 +68,7 @@ class Runtime:
         self._db_lock = threading.Lock()
         self._lens_idx = None
         self._con_idx = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # re-entrant: a locked method can call another
         self.model = self.tok = None
         self.status = "idle"
         self.push_p50 = {}
@@ -68,6 +80,8 @@ class Runtime:
         self._capture_all = None
         self._capture_from = 0
         self._capture_full = None
+        self._capture_heads = None  # while set: each layer's query/key side and each head's write size, per token
+        self.heads = None  # the last text's captures: {"T", "q", "writes"}, see full_activations(heads=True)
         self._lens_cache = {}
 
     # ---------- loading ----------
@@ -85,6 +99,12 @@ class Runtime:
             a = A.Arch(m, tok, name=MODEL)
             self.dev, self.lm, self.arch, self.tok = dev, a.lm, a, tok
             self.stop = A.stop_ids(m, tok)
+            # read every norm's scale and shape now: a probe runs the norm, which must happen before the hooks below
+            # are on it (a hook probing its own norm would recurse)
+            for i in range(a.n_layers):
+                a.pre_scale(i), a.attn_pre_scale(i), a.attn_post_scale(i)
+                if a.pre_norms[i] is not None:
+                    a.norm_centred(a.pre_norms[i])
             # logits for the last position only, where the model's forward takes it
             import inspect
             self._last = {"logits_to_keep": 1} if "logits_to_keep" in inspect.signature(m.forward).parameters else {}
@@ -101,6 +121,23 @@ class Runtime:
                 _, out_proj, n_heads = a.attn[i]
                 if out_proj is not None and n_heads:
                     out_proj.register_forward_pre_hook(self._head_hook(i, n_heads))
+                # head captures (full_activations(heads=True)): the MLP's input and its norm's divisor, the attention
+                # output norm's divisor, and each head's queries, keys and values (softmax) or DeltaNet state
+                if a.pre_norms[i] is not None:
+                    a.pre_norms[i].register_forward_hook(self._mlp_in_hook(i))
+                else:
+                    a.mlps[i].module.register_forward_pre_hook(self._mlp_in_hook(i))
+                if a.attn_post_norms[i] is not None:
+                    a.attn_post_norms[i].register_forward_hook(self._attn_post_hook(i))
+                p = a.attn_parts(i)
+                if p is not None:
+                    attn = getattr(layer, a.attn[i][0])
+                    attn.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
+                    if p.kind == "softmax":
+                        attn.register_forward_hook(self._qk_done_hook(i))
+                    else:
+                        attn.norm.register_forward_pre_hook(self._gnorm_hook(i, n_heads))
+            A.install_capture(m)
             self.model = m  # last: ensure_loaded takes a set model to mean everything above is in place
             self.status = "ready"
 
@@ -130,8 +167,63 @@ class Runtime:
                 return (h,)
         return hook
 
+    def _mlp_in_hook(self, i):
+        """On the norm in front of the MLP (or the MLP itself when it reads the raw residual): the MLP's input, and the
+        divisor the norm applied at each token (its rms, or standard deviation for a LayerNorm; 1 without a norm)."""
+        a = self.arch
+        norm = a.pre_norms[i]
+
+        def hook(mod, args, out=None):
+            if self._capture_heads is None:
+                return
+            if norm is None:  # forward pre-hook on the MLP: the residual is the input
+                x = args[0][0]
+                self._capture_heads["x"][i] = x.half()
+                self._capture_heads["rms"][i] = torch.ones(x.shape[0], device=x.device)
+                return
+            r = args[0][0].float()
+            if a.norm_centred(norm):
+                r = r - r.mean(-1, keepdim=True)
+            self._capture_heads["x"][i] = (out[0] if isinstance(out, tuple) else out)[0].half()
+            self._capture_heads["rms"][i] = (r.pow(2).mean(-1) + A.norm_eps(norm)).sqrt()
+        return hook
+
+    def _attn_post_hook(self, i):
+        """On a norm applied to the attention output (Gemma 2/3, OLMo 2): its divisor per token, which also scales each
+        head's write size."""
+        norm = self.arch.attn_post_norms[i]
+
+        def hook(mod, args, out):
+            if self._capture_heads is None:
+                return
+            o = args[0][0].float()
+            rms = (o.pow(2).mean(-1) + A.norm_eps(norm)).sqrt()
+            self._capture_heads["orms"][i] = rms
+            if i in self._capture_heads["writes"]:
+                self._capture_heads["writes"][i] /= rms.cpu()[:, None]
+        return hook
+
+    def _gnorm_hook(self, i, n_heads):
+        def hook(mod, args):
+            if self._capture_heads is not None:  # linear attention: each head's output = scale * (sum of A_ij v_j)
+                o, z = args[0].float(), args[1].float()
+                sc = mod.weight.float() * F.silu(z) * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + mod.variance_epsilon)
+                self._capture_heads["s"][i] = sc.view(-1, n_heads, sc.shape[-1]).transpose(0, 1).half()  # [H, T, D]
+        return hook
+
     def _head_hook(self, i, n_heads):
+        post = self.arch.attn_post_norms[i] is not None
+
         def hook(mod, inp):
+            if self._capture_heads is not None:  # each head's write into the residual: |W_O[:, head] . out_head|
+                x = inp[0][0]
+                xv = x.view(x.shape[0], n_heads, -1)
+                W = A._weight(mod)
+                if post:  # through the post-attention norm's scale; its per-token divisor follows (_attn_post_hook)
+                    W = W * self.arch.attn_post_scale(i).to(W.dtype)[:, None]
+                W = W.view(W.shape[0], n_heads, -1)
+                self._capture_heads["writes"][i] = torch.einsum("thd,ohd->tho", xv, W).float().norm(dim=-1).cpu()  # [T, H]
+                self._capture_heads["y"][i] = xv.transpose(0, 1).half()  # [H, T, D]: each head's output
             mine = [x for x in self._heads if x[0] == i] if self._heads else []
             if not mine:
                 return None
@@ -144,6 +236,410 @@ class Runtime:
                     v[..., head, :] *= scale
             return (h,)
         return hook
+
+    def _qk_hook(self, i):
+        """While capturing heads: what decides each head's attention pattern. Softmax attention (full or sliding-window):
+        the queries, keys and values the model's own attention call receives (after norms and rotary; A.CAPTURE), with
+        its scale, softcap and window, plus the output gate where the query projection carries one (Qwen3.5). Linear
+        attention (Gated DeltaNet): queries and keys after the short conv and l2 norm, plus each token's write strength
+        (beta) and the per-step log decay; head_row() turns these into the exact effective attention row, the weight
+        each earlier token's value gets in a query's output."""
+        p = self.arch.attn_parts(i)
+
+        def hook(mod, args, kwargs):
+            if self._capture_heads is None:
+                return None
+            x = kwargs.get("hidden_states", args[0] if args else None)
+            with torch.inference_mode():
+                T = x.shape[1]
+                if p.kind == "softmax":
+                    c = self._capture_heads["q"][i] = {"kind": "full"}
+                    A.CAPTURE[id(mod)] = c
+                    if p.gated:
+                        hd = p.q.shape[1]
+                        gate = p.q_proj(x).view(T, p.n, 2 * hd)[..., hd:]
+                        c["s"] = gate.float().sigmoid().transpose(0, 1).half()  # [H, T, D]
+                else:
+                    l2norm = sys.modules[type(mod).__module__].l2norm
+                    qkv = mod.in_proj_qkv(x).transpose(1, 2)
+                    w = mod.conv1d.weight
+                    qkv = F.silu(F.conv1d(F.pad(qkv, (w.shape[-1] - 1, 0)), w, groups=mod.conv_dim)).transpose(1, 2)[0]
+                    q, k, v = torch.split(qkv, [mod.key_dim, mod.key_dim, mod.value_dim], -1)
+                    q = l2norm(q.float().view(T, -1, mod.head_k_dim)) / mod.head_k_dim ** 0.5
+                    k = l2norm(k.float().view(T, -1, mod.head_k_dim))
+                    beta = mod.in_proj_b(x)[0].float().sigmoid()  # [T, Hv]
+                    logd = -mod.A_log.float().exp() * F.softplus(mod.in_proj_a(x)[0].float() + mod.dt_bias)  # [T, Hv]
+                    self._capture_heads["q"][i] = {"kind": "linear", "q": q.transpose(0, 1).half(), "k": k.transpose(0, 1).half(),
+                                                   "beta": beta.T.contiguous(), "logd": logd.T.contiguous(),
+                                                   "rep": mod.num_v_heads // mod.num_k_heads,
+                                                   "v": v.view(T, -1, mod.head_v_dim).transpose(0, 1).half()}
+            return None
+        return hook
+
+    def _qk_done_hook(self, i):
+        """After a softmax layer's attention ran during a capture: its captured queries, keys and values as float32
+        [heads, T, dim] (float16 would round large logits enough to move the softmax: Pythia, Qwen2.5's first layer),
+        and the scale (1 / sqrt(dim) when the call passed none)."""
+        def hook(mod, args, out):
+            c = A.CAPTURE.pop(id(mod), None)
+            if c is None or "q" not in c:
+                if c is not None:  # the attention call never came through the capture: no pattern for this layer
+                    self._capture_heads["q"].pop(i, None)
+                return
+            c.update(q=c["q"].float(), k=c["k"].float(), v=c["v"].float())
+            c["scale"] = c.pop("scaling") or c["q"].shape[-1] ** -0.5
+        return hook
+
+    @staticmethod
+    def _soft_scores(c, s, qpos, kpos):
+        """Softmax logits s (already scaled) with the layer's softcap, causal mask and sliding window: positions are
+        query indices [Q] and key indices [K]."""
+        if c.get("softcap"):
+            s = torch.tanh(s / c["softcap"]) * c["softcap"]
+        allowed = kpos[None, :] <= qpos[:, None]
+        if c.get("window"):
+            allowed &= qpos[:, None] - kpos[None, :] < c["window"]
+        return s.masked_fill(~allowed, float("-inf"))
+
+    def head_row(self, layer, head, pos):
+        with self.lock:
+            return self._head_row(layer, head, pos)
+
+    def _head_row(self, layer, head, pos):
+        """Attention row of one head for query token `pos` of the last captured text: the weight of every token
+        0..pos in that head's output there. Softmax attention: the softmax pattern. Linear attention: the exact
+        effective weight (signed; queries carried back through each later token's decay and delta-rule write), scaled
+        so its absolute values sum to 1."""
+        c = self.heads["q"][layer]
+        row = self.raw_row(layer, head, pos)
+        if c["kind"] == "full":
+            return row.cpu().tolist()
+        return (row / row.abs().sum().clamp(min=1e-12)).cpu().tolist()
+
+    def head_pattern(self, layer, head):
+        with self.lock:
+            return self._head_pattern(layer, head)
+
+    def _head_pattern(self, layer, head):
+        """The whole attention pattern of one head on the last captured text: [T, T], row = query token, column = the
+        earlier token it reads (zero above the diagonal). Linear layers give the exact effective weights, each row
+        scaled so its absolute values sum to 1, as in head_row()."""
+        return self._layer_patterns(layer, None, [head])[0]
+
+    def raw_row(self, layer, head, pos, caps=None):
+        """(Called with the model lock held.) The attention row of one head at token `pos`, unscaled: softmax weights (softmax attention) or the exact
+        effective weights (linear attention), so that the head's output there is scale * sum_j row[j] * v_j."""
+        c = (caps or self.heads)["q"][layer]
+        with torch.inference_mode():
+            if c["kind"] == "full":
+                kv = head // (c["q"].shape[0] // c["k"].shape[0])
+                s = (c["k"][kv, :pos + 1].float() @ c["q"][head, pos].float()) * c["scale"]
+                dev = s.device
+                s = self._soft_scores(c, s[None], torch.tensor([pos], device=dev), torch.arange(pos + 1, device=dev))[0]
+                return s.softmax(-1)
+            kh = head // c["rep"]
+            q, k = c["q"][kh].float(), c["k"][kh].float()
+            beta, d = c["beta"][head], c["logd"][head].exp()
+            u, row = q[pos].clone(), torch.zeros(pos + 1, device=q.device)
+            for j in range(pos, -1, -1):
+                dot = u @ k[j]
+                row[j] = beta[j] * dot
+                u = d[j] * (u - beta[j] * dot * k[j])
+            return row
+
+    def attn_drive(self, layer, n, pos, caps=None, top=6):
+        with self.lock:
+            return self._attn_drive(layer, n, pos, caps, top)
+
+    def _attn_drive(self, layer, n, pos, caps=None, top=6):
+        """How attention drives neuron n of `layer` at token `pos` of a captured text (full_activations(heads=True)).
+        The activation act(gate) * up is linearised in the residual at this token, through the pre-MLP norm with its
+        divisor held at this token's value (and, on models that normalise the attention output, through that norm the
+        same way). Returns act (the activation), total (the linearised drive of the whole residual), heads
+        ([(layer, head, contribution)] for every head at this layer or earlier whose output the MLP reads: its output
+        read by the linearisation) and src ({(layer, head): [contribution per token 0..pos]}, for the `top` heads by
+        size, softmax and linear heads: attention weight times what that token's value carries)."""
+        c = caps or self.heads
+        a = self.arch
+        mlp = a.mlps[layer]
+        with torch.inference_mode():
+            x, rms = c["x"][layer][pos].float(), c["rms"][layer][pos].float()
+            G, U = mlp.read_w()
+            bg, bu = mlp.read_b()
+            wg = G[n].float()
+            g = float(wg @ x) + (float(bg[n]) if bg is not None else 0.0)
+            wu = U[n].float() if U is not None else None
+            u = float(wu @ x) + (float(bu[n]) if bu is not None else 0.0) if U is not None else None
+        with torch.inference_mode(False), torch.enable_grad():  # the activation's slope at g, from the model's own act
+            gt = torch.tensor(float(g), requires_grad=True)
+            av = mlp.act(gt)
+            av.backward()
+            act_g, slope = float(av.detach()), float(gt.grad)
+        with torch.inference_mode():
+            Jx = slope * u * wg + act_g * wu if U is not None else slope * wg  # d act / d (MLP input)
+            norm = a.pre_norms[layer]
+            b = getattr(norm, "bias", None) if norm is not None else None
+            total = float(Jx @ (x - b.float() if b is not None else x))
+            J = Jx * a.pre_scale(layer) / rms  # d act / d residual, the norm's divisor held
+            if norm is not None and a.norm_centred(norm):
+                J = J - J.mean()
+            out, T = [], {}
+            for l in range(layer + (0 if a.parallel[layer] else 1)):
+                if l not in c["y"]:
+                    continue
+                Jl = J * a.attn_post_scale(l) / c["orms"][l][pos].float() if l in c["orms"] else J
+                W = A._weight(a.attn[l][1]).float()
+                y = c["y"][l][:, pos].float()  # [H, D]
+                t = (W.T @ Jl).view(y.shape)
+                T[l] = t
+                out += [(l, h, float(v)) for h, v in enumerate((t * y).sum(-1).tolist())]
+            src = {}
+            for l, h, _ in sorted(out, key=lambda r: -abs(r[2]))[:top]:
+                q = c["q"].get(l)
+                if q is None:
+                    continue
+                if q["kind"] == "full":
+                    v = q["v"][h // (q["q"].shape[0] // q["k"].shape[0]), :pos + 1].float()
+                    sc = q["s"][h, pos].float() if "s" in q else 1.0
+                else:
+                    v, sc = q["v"][h, :pos + 1].float(), c["s"][l][h, pos].float()
+                src[(l, h)] = (self.raw_row(l, h, pos, c) * (v @ (sc * T[l][h]))).tolist()
+            return {"act": act_g * u if U is not None else act_g, "total": total, "heads": out, "src": src}
+
+    def layer_patterns(self, layer, caps=None):
+        with self.lock:
+            return self._layer_patterns(layer, caps)
+
+    def _layer_patterns(self, layer, caps=None, heads=None):
+        """head_pattern() for every head of a layer at once (or those in `heads`): [H, T, T], from `caps` (a
+        self.heads capture) or the last captured text."""
+        c = (caps or self.heads)["q"][layer]
+        with torch.inference_mode():
+            if c["kind"] == "full":
+                q = c["q"].float() if heads is None else c["q"][heads].float()
+                rep = c["q"].shape[0] // c["k"].shape[0]
+                k = c["k"].float().repeat_interleave(rep, 0)
+                k = k if heads is None else k[heads]
+                s = (q @ k.transpose(1, 2)) * c["scale"]
+                T = s.shape[-1]
+                pos = torch.arange(T, device=s.device)
+                return self._soft_scores(c, s, pos, pos).softmax(-1).cpu().numpy()
+            q = c["q"].float().repeat_interleave(c["rep"], 0)
+            k = c["k"].float().repeat_interleave(c["rep"], 0)
+            beta, d = c["beta"].float(), c["logd"].float().exp()  # [H, T]
+            if heads is not None:
+                q, k, beta, d = q[heads], k[heads], beta[heads], d[heads]
+            H, T, D = q.shape
+            A_ = torch.zeros(H, T, T, device=q.device)
+            U = torch.zeros(H, T, D, device=q.device)
+            for j in range(T - 1, -1, -1):
+                U[:, j] = q[:, j]
+                dot = (U @ k[:, j, :, None])[..., 0]  # [H, T]
+                A_[:, :, j] = beta[:, j, None] * dot
+                U = d[:, j, None, None] * (U - (beta[:, j, None] * dot)[..., None] * k[:, j, None, :])
+            A_ = A_ / A_.abs().sum(-1, keepdim=True).clamp(min=1e-12)
+            return A_.cpu().numpy()
+
+    def _head_slices(self, l, h):
+        """One head's weight slices after the norms around it: value rows and query / key rows [dim, hidden] after the
+        pre-attention norm's scale, output columns [hidden, dim] through the gated norm (DeltaNet) and the
+        post-attention norm's scale (Gemma); None when the layer's attention isn't one this code can cut into heads."""
+        a = self.arch
+        p = a.attn_parts(l)
+        if p is None:
+            return None
+        g = a.attn_pre_scale(l).float()
+        WO = p.out[:, h].float()
+        if p.o_scale is not None:
+            WO = WO * p.o_scale.float()
+        WO = WO * a.attn_post_scale(l).float()[:, None]
+        return {"v": p.v[p.v_of(h)].float() * g, "o": WO, "q": p.q[p.q_of(h)].float() * g, "k": p.k[p.k_of(h)].float() * g}
+
+    def _mlp_reads(self, l):
+        """Layer l's MLP read rows after its pre-MLP norm's scale: (gate [N, hidden], up [N, hidden] or None)."""
+        a = self.arch
+        w = a.pre_scale(l).float()
+        G, U = a.mlps[l].read_w()
+        return G.float() * w, (U.float() * w if U is not None else None)
+
+    @_locked
+    def head_links(self, layer, head, k=40):
+        """Weight-level reads and writes of one attention head. reads: earlier neurons whose write column lands in the
+        head's value read space, as the share of the column's length the head picks up (after the pre-attention norm
+        weight); writes: neurons whose MLP reads this head's output (this layer or later; later only when attention
+        and MLP run side by side) and whose gate and up rows read the head's output space, the same share for each
+        row, multiplied (the gate row alone for an ungated MLP). Shares make large-norm neurons that line up with every
+        head (hubs) sink. Each list is the top k by that share, z-scored over all candidate neurons. q and k: earlier
+        neurons whose write column lands in the head's query or key read space, the same way as reads."""
+        key = f"{layer}:{head}:{k}:qk"
+        with self._db_lock:
+            self._db.execute("CREATE TABLE IF NOT EXISTS headcon (key TEXT PRIMARY KEY, val TEXT)")
+            row = self._db.execute("SELECT val FROM headcon WHERE key = ?", (key,)).fetchone()
+        if row:
+            return json.loads(row[0])
+        self.ensure_loaded()
+        a = self.arch
+        with self.lock, torch.inference_mode():
+            hs = self._head_slices(layer, head)
+            if hs is None:
+                return {"reads": [], "writes": [], "q": [], "k": [],
+                        "error": f"layer {layer}'s attention can't be cut into heads for {MODEL}"}
+            # orthonormal bases of the read and write spaces, so a share is a plain projection length
+            QV = torch.linalg.qr(hs["v"].T.cpu())[0].to(self.dev)  # [hidden, hd]
+            QO = torch.linalg.qr(hs["o"].cpu())[0].to(self.dev)
+            QQ = torch.linalg.qr(hs["q"].T.cpu())[0].to(self.dev)
+            QK = torch.linalg.qr(hs["k"].T.cpu())[0].to(self.dev)
+
+            def top(scores):
+                s = torch.cat(scores)
+                z = (s - s.mean()) / (s.std() + 1e-8)
+                t = z.topk(min(k, z.numel()))
+                N = scores[0].numel()
+                return t.values.tolist(), t.indices.tolist(), N
+            reads, rq, rk, wr = [], [], [], []
+            for l in range(layer):
+                D = a.write_w(l).float()  # [hidden, N]
+                dn = D.norm(dim=0).clamp(min=1e-8)
+                reads.append(((QV.T @ D).norm(dim=0) / dn).cpu())
+                rq.append(((QQ.T @ D).norm(dim=0) / dn).cpu())
+                rk.append(((QK.T @ D).norm(dim=0) / dn).cpu())
+            first = layer + 1 if a.parallel[layer] else layer
+            share = lambda R: (R @ QO).norm(dim=1) / R.norm(dim=1).clamp(min=1e-8)
+            for l in range(first, a.n_layers):
+                G, U = self._mlp_reads(l)
+                wr.append((share(G) * share(U) if U is not None else share(G)).cpu())
+            out = {}
+            for side, scores, l0 in (("reads", reads, 0), ("q", rq, 0), ("k", rk, 0), ("writes", wr, first)):
+                if not scores:
+                    out[side] = []
+                    continue
+                zs, idx, N = top(scores)
+                out[side] = [{"layer": l0 + i // N, "n": i % N, "z": round(z, 2)} for z, i in zip(zs, idx)]
+        with self._db_lock:
+            self._db.execute("INSERT OR REPLACE INTO headcon VALUES (?, ?)", (key, json.dumps(out)))
+            self._db.commit()
+        return out
+
+    @_locked
+    def _head_bases(self):
+        """Orthonormal bases of every head's read space (value rows after the pre-attention norm weight) and write
+        space (output columns, after the gated norm weight on linear layers and the post-attention norm weight where
+        there is one), stacked: (QV [hidden, sum hd], QO [hidden, sum hd], [(layer, head, start, end)])."""
+        if getattr(self, "_hb", None) is not None:
+            return self._hb
+        self.ensure_loaded()
+        qv, qo, spans, at = [], [], [], 0
+        with self.lock, torch.inference_mode():
+            for l in range(self.arch.n_layers):
+                p = self.arch.attn_parts(l)
+                for h in range(p.n if p is not None else 0):
+                    hs = self._head_slices(l, h)
+                    qv.append(torch.linalg.qr(hs["v"].T.cpu())[0]); qo.append(torch.linalg.qr(hs["o"].cpu())[0])
+                    spans.append((l, h, at, at + hs["v"].shape[0])); at += hs["v"].shape[0]
+        self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans) if spans else (None, None, [])
+        return self._hb
+
+    @_locked
+    def neuron_heads(self, layer, n):
+        """Which attention heads carry a neuron's output on, and which feed it, from weights. Later heads: the share
+        of the neuron's write column inside each head's read space. Heads whose output its MLP reads (this layer or
+        earlier; earlier only when attention and MLP run side by side): the share of its gate row inside the head's
+        write space times the same for its up row (after the pre-MLP norm weight; the gate row alone for an ungated
+        MLP). Each side is z-scored over its heads; returns {layer: [z per head]}."""
+        QV, QO, spans = self._head_bases()
+        if not spans:
+            return {}
+        a = self.arch
+        last_writer = layer - 1 if a.parallel[layer] else layer
+        with self.lock, torch.inference_mode():
+            d = a.write_w(layer)[:, n].float()
+            G, U = self._mlp_reads(layer)
+            gr, ur = G[n], (U[n] if U is not None else None)
+            pr = (QV.T @ d).cpu()  # projections of the write column on every head's read basis
+            pg, pu = (QO.T @ gr).cpu(), ((QO.T @ ur).cpu() if ur is not None else None)
+        dn, gn, hid = float(d.norm()), float(gr.norm()), d.shape[0]
+        un = float(ur.norm()) if ur is not None else None
+        reads, writes = [], []
+        for l, h, s, e in spans:
+            base = ((e - s) / hid) ** 0.5  # a random direction's expected share of a (e - s)-dim space
+            if l > layer:
+                reads.append((l, h, float(pr[s:e].norm()) / dn / base))
+            elif l <= last_writer:
+                w = float(pg[s:e].norm()) / gn / base
+                writes.append((l, h, w * float(pu[s:e].norm()) / un / base if pu is not None else w))
+        out = {}
+        for side in (reads, writes):
+            if len(side) < 2:
+                continue
+            v = np.array([x[2] for x in side])
+            z = (v - v.mean()) / (v.std() + 1e-12)
+            for (l, h, _), zz in zip(side, z):
+                out.setdefault(l, {})[h] = round(float(zz), 2)
+        return {l: [hs[h] for h in sorted(hs)] for l, hs in out.items()}
+
+    @_locked
+    def _qk_bases(self):
+        """Orthonormal bases of every attention head's query and key read spaces (input rows, after the pre-attention
+        norm weight), stacked as float16 [hidden, sum dims] with spans [(layer, heads, start, end)]; `heads` lists the
+        output heads that share the space (grouped keys in softmax attention, shared q/k heads in linear attention)."""
+        if getattr(self, "_qkb", None) is not None:
+            return self._qkb
+        self.ensure_loaded()
+        out = {}
+        a = self.arch
+        with self.lock, torch.inference_mode():
+            for role in ("q", "k"):
+                cols, spans, at = [], [], 0
+                for l in range(a.n_layers):
+                    p = a.attn_parts(l)
+                    if p is None:
+                        continue
+                    g = a.attn_pre_scale(l).float()
+                    W = p.q if role == "q" else p.k
+                    for u in range(W.shape[0]):
+                        cols.append(torch.linalg.qr((W[u].float() * g).T.cpu())[0].half())
+                        spans.append((l, p.heads_of(role, u), at, at + W.shape[1])); at += W.shape[1]
+                out[role] = (torch.cat(cols, 1).to(self.dev) if cols else None, spans)
+        self._qkb = out
+        return out
+
+    @_locked
+    def neuron_head_roles(self, layer, n, k=8):
+        """The attention heads a neuron meets, by role, from weights. q / k / v: later heads whose query, key or value
+        read space holds a large share of the neuron's write column (it shapes what they look for from its token,
+        makes its token findable, or is what they carry on). o: heads whose output its MLP reads (neuron_heads). Each
+        role z-scored over its heads; the top k each, {layer, head, z}."""
+        qk = self._qk_bases()
+        zs = self.neuron_heads(layer, n)
+        a = self.arch
+        with self.lock, torch.inference_mode():
+            d = a.write_w(layer)[:, n].float()
+            dn = float(d.norm())
+            proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items() if B is not None}
+        roles = {}
+        for r, (_, spans) in qk.items():  # shares relative to a random direction's, as in neuron_heads
+            side = [(l, hs, float(proj[r][s:e].norm()) / dn / ((e - s) / d.shape[0]) ** 0.5)
+                    for l, hs, s, e in spans if l > layer] if r in proj else []
+            if len(side) < 2:
+                roles[r] = []
+                continue
+            v = np.array([x[2] for x in side]); z = (v - v.mean()) / (v.std() + 1e-12)
+            rows = sorted(((zz, l, hs) for (l, hs, _), zz in zip(side, z)), key=lambda x: -x[0])[:k]
+            roles[r] = [{"layer": l, "head": hs[0], "heads": hs, "z": round(float(zz), 1)} for zz, l, hs in rows]
+        flat = [(z, int(l), h) for l, row in zs.items() for h, z in enumerate(row)]
+        for r, keep in (("v", lambda l: l > layer), ("o", lambda l: l <= layer)):
+            rows = []  # heads sharing one value space (grouped in softmax attention) score alike: one entry each
+            for z, l, h in sorted((x for x in flat if keep(x[1])), reverse=True):
+                if rows and rows[-1]["layer"] == l and rows[-1]["z"] == round(z, 1):
+                    rows[-1]["heads"].append(h)
+                elif len(rows) < k:
+                    rows.append({"layer": l, "head": h, "heads": [h], "z": round(z, 1)})
+                else:
+                    break
+            for x in rows:
+                x["heads"].sort(); x["head"] = x["heads"][0]
+            roles[r] = rows
+        return roles
 
     def n_heads(self, layer):
         self.ensure_loaded()
@@ -366,6 +862,7 @@ class Runtime:
                 self._steer_idx = z if fits(z["up"], self.shape, path) else False
         return self._steer_idx or None
 
+    @_locked
     def lens(self, layer, n, k=16):
         idx = self.lens_index()
         if idx is not None and k <= idx["up"].shape[-1]:
@@ -390,6 +887,7 @@ class Runtime:
         return out
 
     # ---------- connections ----------
+    @_locked
     def connections(self, layer, n, k=24, lens_k=5):
         """Direct-path weights between neuron (layer, n) and neurons in other layers, ignoring everything between.
         Downstream B in layer j > layer: g = W_gate_j[B] . (s_j * d_n), u = W_up_j[B] . (...), where d_n is this
@@ -548,13 +1046,20 @@ class Runtime:
         self.status = "ready"
         return path
 
-    def full_activations(self, ids):
-        """Every neuron's activation at every token: float32 array [layers, tokens, inter]."""
+    def full_activations(self, ids, heads=False):
+        """Every neuron's activation at every token: float32 array [layers, tokens, inter]. With heads, the same pass
+        also keeps what head_row() needs and every head's write size per token (self.heads)."""
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
             self._capture_full = {}
+            if heads:
+                self._capture_heads = {"q": {}, "writes": {}, "y": {}, "s": {}, "x": {}, "rms": {}, "orms": {}}
             try:
                 self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
+                if heads:
+                    self.heads = {"T": len(ids), "ids": list(ids), **self._capture_heads}
                 return torch.stack([self._capture_full[l] for l in sorted(self._capture_full)]).numpy()
             finally:
                 self._capture_full = None
+                self._capture_heads = None
+                A.CAPTURE.clear()

@@ -20,9 +20,21 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 6. **Run a blind maximum.** Write one sentence from the label alone. If it beats every example found so far, the label is near the center (`L20 N7531`: 2.44 from "The ratio of prices between the two regions differs by a factor of three", above its 0.93 dataset max).
 7. **Close with logprobs.** `logprobs` with the neuron zeroed or pushed shows exactly which next tokens it moves and by how much. This is the final word on what the neuron does to the output.
 
+## Finding a lever for a behaviour ("make Qwen want X")
+
+1. **Separate the stance from the topic.** Neurons for a subject (beer: brewing, styles, history) differ from neurons for the stance toward it (craving, wanting, enjoying). Contrast matched texts: the target ("I'm dying for a cold beer right now"), the same topic without the stance ("Beer is brewed from malted barley"), and the same stance on another object ("I'm dying for a cold lemonade"). Keep neurons that fire on the first and not the other two. Run the contrast by script over 6–10 sentence triples, collecting `fires` at the key tokens.
+2. **Look at the right token.** Topic neurons peak on the noun; stance and mood neurons peak at summary positions (end of clause, `.`, `\n`, `</think>`) and on the token before the object ("dying for a **cold**…").
+3. **Steer every candidate on unrelated prompts** ("Tell me about your weekend.", "What should I do this afternoon?", "Describe a sunset.") at 0.6, 1.0 and 1.5. Success means the behaviour appears unprompted while the text stays coherent; a neuron that only repeats the word ("beer beer beer") is a word writer, not the lever.
+4. **When a clean detector steers badly, steer its drivers.** At its peak, ablate its inputs (`mul 0` on candidate neurons, whole layers, heads) or run `attn_drive`, then steer the strongest upstream neurons. The tone often sits downstream and the idea upstream (see the motif below).
+5. **Stack two or three levers at lower doses** and confirm with `logprobs` on a fork ("Right now I'd love a ___" → `beer`) that the push is the intended one.
+6. **Report a recipe** as neuron, sign and dose (`L10 N7757 +1.3`), with one short example output per prompt.
+
 ## Reading each source
 
 - **Steer lens.** Tokens such as `作为` (as a…), `您的` (your, polite), `无法` / `cannot`, `我是一个` (I am a…) appear across a great many neurons. They are a signature of measuring on chat prompts and carry little information about the specific neuron. Weight the remaining, specific tokens.
+- **Steer-lens ranking is by gain.** Rare tokens can top the list while moving between one-in-a-billion and one-in-a-hundred-million, so a striking surface pattern there (spelling, sound) can be a shadow of the real direction (`L19 N5504`'s lens is mostly w-words; in logprobs those stay near 1e-9 while `Instead`, `Though`, `其实` "actually" carry the effect). Check absolute probabilities before naming a neuron from a lens pattern.
+- **Constant neurons.** A neuron that sits near one value on every token (e.g. `L6 N159` ≈ −0.9 everywhere, delivered by L0 attention) can show a huge steer KL while zeroing or doubling it barely moves the next token. Check `mul 0` and `mul 2` with `logprobs` before reading meaning into its lens.
+- **Real top activations.** `work/fw_sweep.py <layer> <n>` rebuilds the 10k FineWeb-Edu tokens that `act_range` was measured on and prints the neuron's strongest tokens in context. Use it whenever hand-written tests stay below 0.3× of the range; some neurons only fire deep inside a long document (`L17 N9143`).
 - **Logit lens.** Most useful in late layers. Specific repeated tokens (`method` × 12, `egg` × 12) are reliable; mixed fragments are noise.
 - **Web summary.** Pooled steer-lens words over the cone. A token on both `fed_by` and `held_by` (e.g. `XSS`, `（`, `.`) often reflects pooling; treat shared topical words differently, see "Fed and held by the same topic" below.
 - **Weight links (`writes_into`, `reads_from`, cone).** Leads to check, never circuits. Verify any claimed path with activations under ablation; `L22 N3467 → L31 N1348` was a real, causal link whose removal changed nothing in the output.
@@ -38,6 +50,9 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 - **Distributed triggers.** Planning neurons are often driven by many small inputs plus attention rather than one upstream switch. `L22 N3467`'s 6.2 is spread across L9–L10 MLPs, L17–L18 heads and several safety neurons, with L11–L17 MLPs acting as a brake.
 - **High-gain, rare writers.** A huge steer KL with almost no natural firing marks a lever whose trigger lies outside test sentences. `L26 N4405` (KL 7.4) turns any answer into zeros ("A spider has 0 legs") yet fires only weakly on CSS `margin`, with negligible effect there. Label these by effect and mark the trigger as unknown.
 - **Meaning over spelling.** `L20 N7531` fires on `is_larger`, `compare`, `ratio`, `differ` but not on `>`, `==` or `max()`; `L25 N4719` ignores words that merely start with "co-".
+- **Tone downstream, idea upstream.** A detector can steer into vocabulary without content while its drivers steer into the idea. `L19 N7839−` fires at −12.6 on "the truth they **don't** want you to know" but, pushed, writes "elite elite elite"; its driver `L10 N7757+` (`normal` / `Secret`) alone writes coherent fringe theories ("not part of mainstream history… a secret society").
+- **Facts stored in MLPs, moved by heads, worded late.** Gender of a name, list counts and speaker identity are each spread over many early MLP neurons, carried by a few heads, and turned into a word by a late neuron. Heads often read an intermediate token that already holds the fact: L25 h3 reads the verb ("Alice **went**… because"), not the name, to feed the he-veto `L26 N538`. The line-final `\n` of a chat message acts as that message's summary for later heads.
+- **Female marked, male default.** The she/he choice runs through one veto neuron for female referents (`L26 N538` blocks he/him/his) and many small pushes for male ones.
 
 ## Doses
 
@@ -66,3 +81,24 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 - `L23 N7748`: writes eggs; + counted-ingredient slots, − keeps other foods in play.
 - `L25 N4719−`: cosine comes next (x-component → cos).
 - `L26 N4405`: writes zero; trigger unknown.
+- `L10 N7757+`: fringe-theory narrator ("not part of mainstream history… a secret society").
+- `L12 N2920−`: confident endorsement of a bad idea (sycophancy lever).
+- `L15 N3920+`: overclaimed evaluation (sarcasm, mock hyperbole) → sarcastic "right?".
+- `L18 N7870+`: visual outline / silhouette / "shaped like".
+- `L18 N9069+`: bundling a just-listed set ("a combination of these", "the latter two", "both").
+- `L25 N6099−`: AI self-identity ("I am / Qwen is a … large language model").
+- `L26 N538+`: female referent → vetoes he / him / his; +0.5 turns Einstein into "she".
+- Speaker labels: `L4 N2424`, `L12 N2978` (transcript / screenplay label colon) → `L19 N5644−`, `L28 N1501` (an utterance opens).
+
+## Reference heads
+
+- L25 h3: carries a subject's gender to the pronoun slot, reading the verb.
+- L18 h18, L19 h11: carry list counts (2–5 items) from commas and "and" to the quantifier.
+- L11 h14 and L15 h1/h2/h3/h12/h15: recall the current speaker's own earlier messages, by name.
+- L15 h10: reads the previous turn (the message being replied to). L3 h10: pulls in messages similar in style to the current token.
+- L11 h3: binds "you" to the addressee named in the message ("Dave, are you…").
+- L24 h30: Qwen's third-person self-reference as "she"; ×2 removes "He".
+
+## Practical notes
+
+- `fires` and `top_firing` read the first token matching `token`; for a repeated token such as the final `\n` of a transcript, pass `at` (an index, negative from the end). `attention` and `attn_drive` take `at` too.
