@@ -8,6 +8,8 @@ stats/
 captures/
 logs/
 explorer/cache/connections.sqlite
+# models other than Qwen3.5-4B keep their caches in explorer/cache/<org>--<name>/ (large; built locally)
+explorer/cache/*/
 
 # third-party material
 source/
@@ -17,6 +19,7 @@ scripts/mirror.log
 explorer/cache/agent/
 *.zip
 explorer/names.json
+explorer/names.*.json
 explorer/*.local.md
 
 # per-machine pod settings

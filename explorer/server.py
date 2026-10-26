@@ -1,6 +1,7 @@
 """Neuron explorer server: sweep data, names, embeddings, and the live model.
 
-    uv run python explorer/server.py            # http://localhost:8791
+    uv run python explorer/server.py                                            # http://localhost:8791, Qwen3.5-4B
+    EXPLORER_MODEL=Qwen/Qwen2.5-0.5B-Instruct uv run python explorer/server.py  # any other model
 """
 import asyncio
 import builtins
@@ -15,22 +16,22 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from arch import DEFAULT_MODEL, describe, slug  # noqa: E402
 from rank import compute_units  # noqa: E402
-from runtime import NO_MODEL, Runtime  # noqa: E402
+from runtime import CACHE, MODEL, NO_MODEL, Runtime, fits  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
+# neuron names are per model; Qwen3.5-4B keeps the original file
+NAMES = os.path.join(ROOT, "explorer", "names.json" if MODEL == DEFAULT_MODEL else f"names.{slug(MODEL)}.json")
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
+ARCH = describe(MODEL)  # from the config, weights not needed
+SHAPE = (ARCH["n_layers"], ARCH["inter"])
+# neuron indices go over the wire as int16 while they fit
+WIRE = np.int16 if ARCH["inter"] <= np.iinfo(np.int16).max else np.int32
 
 app = FastAPI()
 
@@ -58,16 +59,16 @@ async def no_store(request, call_next):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
-rt = Runtime(STATS)
+rt = Runtime(STATS, SHAPE)
 _cache = {}
 
 
 def layer_runs():
-    """layer -> path of its sweep run: main_rel preferred, then the largest (calibration runs excluded)."""
+    """layer -> path of this model's sweep run: main_rel preferred, then the largest (calibration runs excluded)."""
     best = {}
     for meta_path in glob.glob(os.path.join(RUNS, "*.meta.json")):
         meta = json.load(open(meta_path))
-        if meta.get("design_name", "main") == "calib":
+        if meta.get("design_name", "main") == "calib" or meta.get("model", DEFAULT_MODEL) != MODEL:
             continue
         jsonl = meta_path.replace(".meta.json", ".jsonl")
         if not os.path.exists(jsonl):
@@ -142,10 +143,15 @@ def names():
     return json.load(open(NAMES)) if os.path.exists(NAMES) else {}
 
 
+def arch_now():
+    """ARCH, with what only the loaded model can tell (whether the MLP output is normalised) once it is loaded."""
+    return {**ARCH, "post_mlp_norm": rt.arch.post_mlp_norm} if rt.arch is not None else ARCH
+
+
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL, "arch": arch_now(),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -279,14 +285,15 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
+LENS_INDEX = os.path.join(CACHE, "lens_index.npz")
 _lens = {}
 
 
 def lens_index():
     if "up" not in _lens and os.path.exists(LENS_INDEX):
         z = np.load(LENS_INDEX)
-        _lens["up"], _lens["down"] = z["up"], z["down"]
+        if fits(z["up"], SHAPE, LENS_INDEX):
+            _lens["up"], _lens["down"] = z["up"], z["down"]
     return _lens if "up" in _lens else None
 
 
@@ -327,17 +334,27 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
-MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
+ACT_SCALE = os.path.join(CACHE, "act_scale.npz")
+# [layers, T, neurons] float32 activations plus scores, 8 bytes a neuron a token: about 2.4 GB at 1024 tokens of
+# Qwen3.5-4B (32 x 9216); larger models get fewer tokens for the same memory
+MAX_INFER_TOKENS = int(max(64, min(1024, 2.42e9 // (8 * SHAPE[0] * SHAPE[1]))))
+
+
+def act_scale():
+    """act_scale.npz when it exists and fits this model, else None."""
+    if not os.path.exists(ACT_SCALE):
+        return None
+    sc = np.load(ACT_SCALE)
+    return sc if fits(sc["pos"], SHAPE, ACT_SCALE) else None
 
 
 @app.get("/api/fires")
 async def fires(text: str, limit: int = 300, chat: bool = False):
     """Neurons that fire hardest on `text` relative to their typical range over web text (activation / typical max,
     and activation / typical min for the negative side)."""
-    if not os.path.exists(ACT_SCALE):
+    sc = act_scale()
+    if sc is None:
         return {"ready": False, "results": []}
-    sc = np.load(ACT_SCALE)
     ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
     acts = await asyncio.to_thread(rt.all_activations, ids)
     toks = [rt.tok.decode([t]) for t in ids]
@@ -346,7 +363,7 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
         p = mx.numpy() / np.maximum(sc["pos"][l], 1e-3)
         q = mn.numpy() / np.minimum(sc["neg"][l], -1e-3)
         for arr, idx, sign, raw in ((p, amx.numpy(), "+", mx.numpy()), (q, amn.numpy(), "-", mn.numpy())):
-            top = np.argpartition(-arr, limit)[:limit]
+            top = np.argpartition(-arr, builtins.min(limit, arr.size - 1))[:limit]
             cand += [(float(arr[n]), l, int(n), sign, int(idx[n]), float(raw[n])) for n in top]
     cand.sort(reverse=True)
     idx_lens, nm = lens_index(), names()
@@ -365,10 +382,12 @@ _infer = {}
 async def score_text(text, chat=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
     multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz)."""
+    sc = act_scale()
+    if sc is None:
+        raise RuntimeError(f"no activation scale for {MODEL} yet ({ACT_SCALE}; the server builds it at startup)")
     ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
     ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids)  # [L, T, N]
-    sc = np.load(ACT_SCALE)
     # a side the neuron barely reaches in calibration is scaled by at least a tenth of its other side
     pos = np.maximum(sc["pos"], np.maximum(0.1 * -sc["neg"], 1e-3))[:, None, :]
     neg = np.minimum(sc["neg"], np.minimum(-0.1 * sc["pos"], -1e-3))[:, None, :]
@@ -382,7 +401,7 @@ async def score_text(text, chat=False):
 async def infer(req: Request):
     """Runs text through the model and keeps every neuron's activation at every token for /api/infer/view."""
     b = await req.json()
-    if not os.path.exists(ACT_SCALE) or rt.tok is None:
+    if act_scale() is None or rt.tok is None:
         return {"ready": False}
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
     units = rt.token_units(ids)
@@ -444,14 +463,14 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     signed by the push the writer's actual activation gives the reader (link sign x sign of the writer's score), so
     yellow / magenta read as "this firing pushed that one up / down"; hop is 1."""
     if "score" not in _infer or pos >= _infer["score"].shape[1]:
-        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
+        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0", "X-Web-Dtype": WIRE.__name__})
     S = _infer["score"][:, pos, :]  # [L, N]
     flat = np.abs(S).ravel()
     cand = np.argpartition(-flat, min_k := builtins.min(top, flat.size - 1))[:min_k]
     cand = cand[flat[cand] >= min]
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
-    ci = rt.con_index()
+    ci = rt.con_index() or {"k": 0}
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -462,20 +481,27 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
             if t in active:
                 push = int(ci["down_sign"][l, n, i]) * (1 if S[l, n] > 0 else -1)
                 rows.append((l, n, *t, round(z * 10) * push, 1))
-    out = np.array(rows, np.int16).reshape(-1, 6)
+    out = np.array(rows, WIRE).reshape(-1, 6)
     return Response(out.tobytes(), media_type="application/octet-stream",
-                    headers={"X-Web-Total": str(len(out)), "X-Active": str(len(active))})
+                    headers={"X-Web-Total": str(len(out)), "X-Active": str(len(active)), "X-Web-Dtype": WIRE.__name__})
 
 
 @app.get("/api/layout")
 def layout(kind: str = "writes"):
-    """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
+    """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16 (int32 when the grid has more
+    cells than int16 holds), layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    path = os.path.join(CACHE, f"layout_{os.path.basename(kind)}.npz")
     if not os.path.exists(path):
         return {"available": False}
-    cell = np.load(path)["cell"].astype(np.int16)
-    return {"available": True, "shape": list(cell.shape), "cell": base64.b64encode(cell.tobytes()).decode()}
+    cell = np.load(path)["cell"]
+    if not fits(cell, SHAPE, path):
+        return {"available": False}
+    side = int(np.ceil(np.sqrt(SHAPE[1])))
+    dt = np.int16 if side * side <= np.iinfo(np.int16).max + 1 else np.int32
+    cell = cell.astype(dt)
+    return {"available": True, "shape": list(cell.shape), "dtype": dt.__name__,
+            "cell": base64.b64encode(cell.tobytes()).decode()}
 
 
 def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
@@ -485,6 +511,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
     out = []
+    if ci is None:  # no connections.npz for this model yet (explorer/build_connections.py)
+        return out
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
         front, seen, hop, start = [(layer, n)], {(layer, n)}, 1, len(out)
@@ -508,10 +536,11 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
 
 @app.get("/api/web")
 def web(layer: int, n: int, first: int = 5, k: int = 2, zmin: float = 15, cap: int = 20000, hops: int = 0):
-    """The cone for the map. Binary int16, 6 per link: src layer, src neuron, dst layer, dst neuron,
-    round(10 * z) * sign, hop."""
-    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in cone_links(layer, n, k, zmin, cap, first, hops or None)], np.int16).reshape(-1, 6)
-    return Response(rows.tobytes(), media_type="application/octet-stream", headers={"X-Web-Total": str(len(rows))})
+    """The cone for the map. Binary int16 (int32 for models with more neurons per layer than int16 holds, named in
+    X-Web-Dtype), 6 per link: src layer, src neuron, dst layer, dst neuron, round(10 * z) * sign, hop."""
+    rows = np.array([(*r[:4], round(r[4] * 10), r[5]) for r in cone_links(layer, n, k, zmin, cap, first, hops or None)], WIRE).reshape(-1, 6)
+    return Response(rows.tobytes(), media_type="application/octet-stream",
+                    headers={"X-Web-Total": str(len(rows)), "X-Web-Dtype": WIRE.__name__})
 
 
 _idf = {}
@@ -529,6 +558,10 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `held_by` (the pole that inhibits it)."""
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
+    if lens is None:  # no steer index, and the logit-lens index is still being built
+        empty = {"neurons": 0, "toward": [], "away": [], "fed_by": [], "held_by": []}
+        return {"src": "logit", "links": 0, "down": {k: empty[k] for k in ("neurons", "toward", "away")},
+                "up": {k: empty[k] for k in ("neurons", "fed_by", "held_by")}}
     v = rt.vocab_strings()
     key_src = "steer" if st is not None else "logit"
     if _idf.get("src") != key_src:
@@ -587,8 +620,7 @@ _act = {}
 
 
 def act_range(layer, n):
-    if "pos" not in _act and os.path.exists(ACT_SCALE):
-        z = np.load(ACT_SCALE)
+    if "pos" not in _act and (z := act_scale()) is not None:
         _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]))
     if "pos" not in _act:
         return None
@@ -599,7 +631,7 @@ def act_range(layer, n):
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
+    return {"model": MODEL, "arch": arch_now(), "layers_with_sweeps": sorted(runs),
             "named_neurons": len(names()), "live_model": not NO_MODEL}
 
 
@@ -639,19 +671,26 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
     idx = rt.steer_index() or rt.lens_index()
     nm = names()
     nodes = sorted(best.items(), key=lambda kv: (abs(kv[1][1]), -abs(kv[1][0])))[:limit]
+    lens5 = (lambda l, m: [v[t] for t in idx["up"][l, m, :5]]) if idx is not None else (lambda l, m: None)
     per_hop = {}
     for _, (_, hop) in best.items():
         per_hop[hop] = per_hop.get(hop, 0) + 1
     return {"links": len(links), "neurons": len(best), "per_hop": dict(sorted(per_hop.items())),
             "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits",
             "nodes": [{"neuron": f"L{l} N{m}", "hop": hop, "z": round(abs(z), 1), "sign": 1 if z > 0 else -1,
-                       "steer_up": [v[t] for t in idx["up"][l, m, :5]], "name": nm.get(f"L{l}/N{m}") or None}
+                       "steer_up": lens5(l, m), "name": nm.get(f"L{l}/N{m}") or None}
                       for (l, m), (z, hop) in nodes]}
 
 
 def _live_off():
     if NO_MODEL:
         return {"error": "the live model is off (server started with EXPLORER_NO_MODEL=1); suggest the test instead"}
+    return None
+
+
+def _scale_off():
+    if act_scale() is None:
+        return {"error": f"no activation scale for {MODEL} yet (the server is still building act_scale.npz)"}
     return None
 
 
@@ -692,6 +731,8 @@ async def agent_activations(req: Request):
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
+        if not rt.n_heads(l):
+            return {"error": f"attention heads of layer {l} can't be scaled on {MODEL} (no head layout found)"}
         if hd is not None and not 0 <= hd < rt.n_heads(l):
             return {"error": f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"}
     r = await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", False), pushes, hs)
@@ -710,6 +751,8 @@ def _interventions(b):
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
+        if not rt.n_heads(l):
+            return pushes, hs, f"attention heads of layer {l} can't be scaled on {MODEL} (no head layout found)"
         if hd is not None and not 0 <= hd < rt.n_heads(l):
             return pushes, hs, f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"
     return pushes, hs, None
@@ -762,6 +805,8 @@ async def agent_compare(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
+    if off := _scale_off():
+        return off
     neurons = [(int(x["layer"]), int(x["n"])) for x in b.get("neurons") or []][:300]
     texts = [(t.get("label") or f"t{i + 1}", t["text"]) if isinstance(t, dict) else (f"t{i + 1}", t)
              for i, t in enumerate((b.get("texts") or [])[:24])]
@@ -790,6 +835,8 @@ async def agent_fires(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
+    if off := _scale_off():
+        return off
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
     toks = [rt.tok.decode([i]) for i in ids]
     want = b.get("token")
@@ -809,7 +856,7 @@ async def agent_fires(req: Request):
         sg = "+" if S[l, n] > 0 else "-"
         res.append({"neuron": f"L{l} N{n}", "pole": sg, "score": round(float(abs(S[l, n])), 2),
                     "act": round(float(acts[l, pos, n]), 3), "name": nm.get(f"L{l}/N{n}") or None,
-                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]]})
+                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]] if st is not None else None})
     return {"tokens": toks, "at": pos, "token": toks[pos],
             "note": "score = activation / the neuron's typical extreme on that side; 1 = as strong as its usual max",
             "neurons": res}
@@ -873,13 +920,56 @@ AGENT_METHOD = os.path.join(ROOT, "explorer", "agent_methodology.md")
 AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this machine's own additions, untracked
 
 
+def _layer_list(ls):
+    """A layer list short enough for the prompt: all of it, an evenly spaced run, or None when neither fits."""
+    if len(ls) <= 8:
+        return ", ".join(map(str, ls))
+    if len({b - a for a, b in zip(ls, ls[1:])}) == 1:
+        return f"{ls[0]}, {ls[1]}, {ls[2]}, ..., {ls[-1]}"
+    return None
+
+
+def model_facts():
+    """The model-specific phrases agent_prompt.md leaves as {PLACEHOLDERS}."""
+    a = arch_now()
+    groups = {}
+    for l, (t, h) in enumerate(zip(a["layer_types"], a["heads"])):
+        groups.setdefault((t, h), []).append(l)
+    parts, short = [], {g: _layer_list(ls) for g, ls in groups.items()}
+    for (t, h), ls in groups.items():
+        kind = t.replace("_", " ")
+        what = (f"{h} value heads" if t == "linear_attention" else f"{h} heads") if h else "no head layout the explorer can scale"
+        if len(groups) == 1:
+            parts.append(f"Every layer has {what} ({kind})")
+            continue
+        # one long irregular group reads as "the rest" when every other group is listed
+        where = short[(t, h)] or ("the rest" if sum(v is None for v in short.values()) == 1 else ", ".join(map(str, ls)))
+        parts.append(f"{kind[0].upper() + kind[1:]} layers ({where}) have {what}")
+    parts.sort(key=lambda p: "(the rest)" in p)  # "the rest" after the groups it is the rest of
+    return {
+        "{MODEL}": MODEL,
+        "{SHAPE}": f"{a['n_layers']} layers, {a['inter']} {a['mlp']} MLP neurons per layer, hidden size {a['hidden']}",
+        "{PUSH_UNIT}": ("the median norm of the layer's MLP output (this model normalises the MLP output before the "
+                        "residual add, so pushes are measured there)") if a.get("post_mlp_norm") else "the median residual norm",
+        "{ZMAX}": str(round(float(np.sqrt(a["inter"] - 1)))),
+        "{HEADS}": "; ".join(parts) + ".",
+    }
+
+
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
-    this checkout's path, written beside the chat's working files."""
+    this checkout's path and the model's facts (model_facts) filled in, written beside the chat's working files."""
     text = open(AGENT_PROMPT).read()
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
-            text = text.rstrip() + "\n\n" + open(extra).read()
+            more = open(extra).read()
+            if extra == AGENT_METHOD and MODEL != DEFAULT_MODEL:
+                title, _, rest = more.partition("\n")
+                more = (f"{title}\n\nThe neuron ids in this method's examples are Qwen3.5-4B's; they mean nothing in "
+                        f"{MODEL}. Take the method, not the ids.\n{rest}")
+            text = text.rstrip() + "\n\n" + more
+    for key, val in model_facts().items():
+        text = text.replace(key, val)
     text = text.replace("{ROOT}", ROOT)
     out = os.path.join(AGENT_DIR, "system_prompt.md")
     if not os.path.exists(out) or open(out).read() != text:
@@ -1056,17 +1146,26 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), h
 
 @app.on_event("startup")
 def preload():
+    model = "" if MODEL == DEFAULT_MODEL else f" --model {MODEL}"
+    missing = [f"  {f}: {cmd}{model}" for f, cmd in (
+        ("connections.npz", "python explorer/build_connections.py"),
+        ("steer_index.npz", "python sweep/steer_lens.py --index"),
+        ("layout_writes.npz", "python explorer/build_layout.py")) if not os.path.exists(os.path.join(CACHE, f))]
+    if missing:
+        print(f"[explorer] {MODEL}: optional caches not built yet (the explorer works without them, with less):\n"
+              + "\n".join(missing), flush=True)
+
     def go():
         if NO_MODEL:
             rt.status = "no model"
             rt.vocab_strings()
             return
         rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
+        if rt.lens_index() is None:
             os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
             rt.build_lens_index(LENS_INDEX)
         rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
+        if act_scale() is None:
             rt.build_act_scale(ACT_SCALE)
     threading.Thread(target=go, daemon=True).start()
 

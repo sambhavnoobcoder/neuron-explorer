@@ -1,4 +1,4 @@
-import { createMap } from "./map3d.js?v=69";
+import { createMap } from "./map3d.js?v=70";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
@@ -18,6 +18,7 @@ const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12,
 
 const index = await api("/api/index");
 const arch = index.arch;
+document.title = `Neuron Explorer · ${index.model}`;
 const tip = $("#tip");
 
 // ---------- map ----------
@@ -33,7 +34,8 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
-      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
+      const kind = (arch.layer_types[p.layer] || "attention").replace("_", " "), heads = arch.heads?.[p.layer] ?? arch.attn_heads;
+      return showTip(x, y, `L${p.layer}`, full ? `${kind} · ${heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads ?? "?"} k / ${heads} v heads`);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;
@@ -85,8 +87,9 @@ async function setLayout(kind) {
     const r = await api(`/api/layout?kind=${kind}`);
     if (wantLayout !== kind) return;
     if (!r.available) { document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === "index")); map.setLayout(null); return; }
-    const bin = atob(r.cell), a = new Int16Array(bin.length / 2);
-    for (let i = 0; i < a.length; i++) a[i] = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    // little-endian int16, or int32 for sheets with more cells than int16 holds
+    const w = r.dtype === "int32" ? 4 : 2, bin = atob(r.cell), a = w === 4 ? new Int32Array(bin.length / 4) : new Int16Array(bin.length / 2);
+    for (let i = 0; i < a.length; i++) { let v = 0; for (let b = w - 1; b >= 0; b--) v = (v << 8) | bin.charCodeAt(w * i + b); a[i] = v; }
     layouts[kind] = a;
   }
   map.setLayout(layouts[kind]);
@@ -96,6 +99,8 @@ setLayout("writes");
 
 // connection web of the focused neuron: downstream cone forward, upstream cone backward
 let webOn = true, webKey = null;
+// link rows as the server sent them: int16, or int32 for models with more neurons per layer than int16 holds
+const webArray = (r, buf) => r.headers.get("X-Web-Dtype") === "int32" ? new Int32Array(buf) : new Int16Array(buf);
 async function refreshWeb() {
   document.querySelectorAll("#web-mode button").forEach(b => b.classList.toggle("on", (b.dataset.w === "on") === webOn));
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
@@ -108,7 +113,7 @@ async function refreshWeb() {
   const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
   if (!r.ok || webKey !== key) return;
   $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
-  map.setWeb(new Int16Array(await r.arrayBuffer()));
+  map.setWeb(webArray(r, await r.arrayBuffer()));
   const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
   if (webKey !== key) return;
   state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
@@ -250,7 +255,7 @@ async function showTokenPaths(pos) {
   const r = await fetch(`/api/infer/paths?pos=${pos}&min=${$("#inf-min").value || 1}`);
   if (!r.ok || (tokHover ?? state.inf.pos) !== pos) return;
   webKey = `tok/${pos}`;
-  map.setWeb(new Int16Array(await r.arrayBuffer()));
+  map.setWeb(webArray(r, await r.arrayBuffer()));
 }
 function previewToken(pos) {
   const keep = state.inf.pos;

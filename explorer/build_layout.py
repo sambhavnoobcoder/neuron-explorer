@@ -1,48 +1,44 @@
-"""Seriated sheet layouts: places each layer's neurons on its 96x96 grid so that neurons with similar weights sit
-together. Embeds each neuron by its down_proj column ("writes": the direction it adds to the residual stream) or its
-gate and up rows ("reads"), cosine-normalised, PCA to 50 dims, UMAP to 2D, then snaps to the grid: sort by y into
-rows of 96, then by x within each row.
+"""Seriated sheet layouts: places each layer's neurons on its square grid (96x96 for Qwen3.5-4B's 9216; ceil(sqrt(N))
+on a side for other widths, the last row partly empty) so that neurons with similar weights sit together. Embeds each
+neuron by its write column ("writes": the direction it adds to the residual stream) or its gate and up rows ("reads"),
+cosine-normalised, PCA to 50 dims, UMAP to 2D, then snaps to the grid: sort by y into rows of the side length, then
+by x within each row.
 
     uv run python explorer/build_layout.py --kind writes
+    uv run python explorer/build_layout.py --kind writes --model Qwen/Qwen2.5-0.5B-Instruct
 
-Writes explorer/cache/layout_<kind>.npz: cell[L, N] (int16, row * 96 + col for neuron n of layer L).
+Writes layout_<kind>.npz to the model's cache folder (explorer/cache/ for Qwen3.5-4B, explorer/cache/<org>--<name>/
+otherwise): cell[L, N] (int16, int32 for grids past 32768 cells; row * side + col for neuron n of layer L).
 """
 import argparse
-import json
 import os
 
 import numpy as np
+import torch
 import umap
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
+
+import arch as A
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+ap.add_argument("--model", default=A.DEFAULT_MODEL)
 ap.add_argument("--kind", default="writes", choices=["writes", "reads"])
 ap.add_argument("--pca", type=int, default=50)
 ap.add_argument("--neighbors", type=int, default=30)
 a = ap.parse_args()
 
-root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
-index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
-L, N = cfg["num_hidden_layers"], cfg["intermediate_size"]
-side = int(round(N ** 0.5))
-assert side * side == N
+model, tok = A.load(a.model, "cpu", torch.bfloat16)  # each layer's weights go to float32 one at a time
+ar = A.Arch(model, tok, name=a.model)
+L, N = ar.n_layers, ar.n_neurons
+side = int(np.ceil(np.sqrt(N)))
 
-
-def tensor(name):
-    with safe_open(os.path.join(root, index[name]), "pt") as f:
-        return f.get_tensor(name).float().numpy()
-
-
-cells = np.zeros((L, N), np.int16)
+cells = np.zeros((L, N), np.int16 if side * side <= 32768 else np.int32)
 for l in range(L):
-    pre = f"model.language_model.layers.{l}.mlp."
-    if a.kind == "writes":
-        X = tensor(pre + "down_proj.weight").T  # [N, hidden]
-    else:
-        X = np.concatenate([tensor(pre + "gate_proj.weight"), tensor(pre + "up_proj.weight")], 1)  # [N, 2*hidden]
+    with torch.inference_mode():
+        if a.kind == "writes":
+            X = ar.write_w(l).T.float().numpy()  # [N, hidden]
+        else:
+            g, u = ar.mlps[l].read_w()
+            X = torch.cat([g, u], 1).float().numpy() if u is not None else g.float().numpy()  # [N, 2*hidden]
     X = X / np.linalg.norm(X, axis=1, keepdims=True)
     X = X - X.mean(0)
     U, S, _ = np.linalg.svd(X, full_matrices=False)
@@ -52,9 +48,10 @@ for l in range(L):
     for r in range(side):
         band = by_y[r * side:(r + 1) * side]
         band = band[np.argsort(xy[band, 0], kind="stable")]
-        cells[l, band] = r * side + np.arange(side)
+        cells[l, band] = r * side + np.arange(len(band))
     print(f"L{l} done", flush=True)
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", f"layout_{a.kind}.npz")
+out = os.path.join(A.cache_dir(a.model), f"layout_{a.kind}.npz")
+os.makedirs(os.path.dirname(out), exist_ok=True)
 np.savez(out, cell=cells)
 print("->", out)

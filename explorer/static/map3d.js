@@ -5,7 +5,8 @@ import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
 // geometry: layers run left to right along x. Each layer is the residual stream passing through a token-mixer slab
-// (linear or full attention) and then the MLP, drawn as a vertical sheet of its neurons.
+// (linear attention thin, softmax attention, full or sliding-window, thick) and then the MLP, drawn as a vertical sheet
+// of its neurons.
 const SHEET = 4.2, GAP = 1.9, SHEET_Y0 = 0.7, ATTN_DX = -0.62, MLP_DX = 0.18;
 const PAL = {
   bg: 0x000000,
@@ -71,7 +72,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   controls.update();
 
   const gridSide = Math.ceil(Math.sqrt(N));
-  let layoutCells = null;  // Int16Array [L * N] of grid cells, or null for neuron-index order
+  let layoutCells = null;  // Int16Array (Int32Array for big sheets) [L * N] of grid cells, or null for neuron-index order
   const neuronPos = (layer, n) => {
     const c = layoutCells ? layoutCells[layer * N + n] : n;
     const i = c % gridSide, j = Math.floor(c / gridSide);
@@ -103,7 +104,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const x = layerX(l), mx = x + MLP_DX, ax = x + ATTN_DX, cs = sheetCorners(mx);
     for (let i = 0; i < 4; i++) seg(cs[i], cs[(i + 1) % 4]);
     seg(V(ax, 0, 0), V(ax, SHEET_Y0, 0)); seg(V(mx, 0, 0), V(mx, SHEET_Y0, 0));
-    const full = arch.layer_types[l] === "full_attention", t = full ? 0.3 : 0.1;
+    const full = arch.layer_types[l] !== "linear_attention", t = full ? 0.3 : 0.1;
     const slab = new THREE.Mesh(new THREE.BoxGeometry(t, SHEET * 0.92, SHEET * 0.92), new THREE.MeshBasicMaterial({
       color: full ? 0x8fa6b2 : 0x6f8590, transparent: true, opacity: (full ? 0.075 : 0.045) * BRIGHT, depthWrite: false }));
     slab.position.set(ax, SHEET_Y0 + SHEET / 2, 0);
@@ -113,7 +114,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       new THREE.LineBasicMaterial({ color: full ? PAL.slabEdgeFull : PAL.slabEdge, transparent: true }));
     edges.position.copy(slab.position); scene.add(edges);
     slab.userData.edges = edges; slab.userData.baseOpacity = slab.material.opacity;
-    const heads = full ? arch.attn_heads : arch.linear_v_heads;
+    const heads = arch.heads?.[l] ?? (full ? arch.attn_heads : arch.linear_v_heads);
     for (let h = 0; h < heads; h++) {
       const z = ((h + 0.5) / heads - 0.5) * SHEET * 0.82;
       (full ? headPos.full : headPos.lin).push(ax + t / 2 + 0.003, SHEET_Y0 + 0.35, z, ax + t / 2 + 0.003, SHEET_Y0 + SHEET - 0.35, z);
@@ -517,7 +518,8 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       buildWeb();
       refreshHighlights();
     },
-    // edges: Int16Array, 6 per link (src layer, src n, dst layer, dst n, 10 * z * sign, hop), or null to hide
+    // edges: Int16Array (Int32Array for wide models), 6 per link (src layer, src n, dst layer, dst n, 10 * z * sign,
+    // hop), or null to hide
     setWeb(edges) { webEdges = edges; buildWeb(); refreshHighlights(); },
     enterLayer, exitLayer, viewLayer, setNotes,
     // centre the view on a neuron, keeping the zoom unless it is wider than a few layers' worth

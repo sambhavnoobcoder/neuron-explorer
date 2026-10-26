@@ -11,7 +11,18 @@ import urllib.request
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
 
-LN = {"layer": {"type": "integer", "description": "layer, 0-31"}, "n": {"type": "integer", "description": "neuron, 0-9215"}}
+
+def _ranges():
+    """The loaded model's layer and neuron ranges, from the explorer (which started this server and is up)."""
+    try:
+        with urllib.request.urlopen(f"{URL}/api/index", timeout=10) as r:
+            a = json.load(r)["arch"]
+        return f"layer, 0-{a['n_layers'] - 1}", f"neuron, 0-{a['inter'] - 1}"
+    except Exception:  # noqa: BLE001  the ranges are a hint; the tools still work without them
+        return "layer index", "neuron index within the layer"
+
+
+LN = dict(zip(("layer", "n"), ({"type": "integer", "description": d} for d in _ranges())))
 TOOLS = [
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -55,7 +66,8 @@ TOOLS = [
     {"name": "steer", "description": "Live: generate from a chat prompt three ways in one batch, pushed up, unsteered, "
      "and pushed down (greedy). Steer one neuron (layer, n) or several at once (neurons: [{layer, n, dose?, mode?}]; all "
      "are applied together, each reversed in the down row; a negative per-neuron dose pushes that one the other way). "
-     "dose in units of the layer's median residual norm for mode 'add' (0.8 is the steer-lens push; 2-3 is strong), or "
+     "dose in units of the layer's median residual norm (MLP-output norm on models that normalise the MLP output) for "
+     "mode 'add' (0.8 is the steer-lens push; 2-3 is strong), or "
      "a multiplier for mode 'mul'. Needs the live model; errors if it is off.",
      "inputSchema": {"type": "object", "properties": {**LN, "prompt": {"type": "string"},
                                                        "neurons": {"type": "array", "items": {"type": "object", "properties": {
@@ -70,8 +82,8 @@ TOOLS = [
      "it as a user turn). Compare against act_range from `neuron`. Optional `neurons` [{layer, n, dose?, mode?}] are "
      "pushed during the same pass (steering units), to test causally whether they drive this neuron: compare with the "
      "same call without them. {layer, all: true, dose: 0} zeroes that layer's whole MLP. Optional `heads` [{layer, "
-     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; full-attention layers have 16 heads, "
-     "linear-attention layers 32 value heads; layer types are in `overview`). Only earlier layers can move it. Needs "
+     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; each layer's head count and type are "
+     "in `overview`, arch.heads and arch.layer_types). Only earlier layers can move it. Needs "
      "the live model; errors if it is off.",
      "inputSchema": {"type": "object", "properties": {**LN, "text": {"type": "string"},
                                                        "chat": {"type": "boolean", "default": False},
