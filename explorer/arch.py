@@ -442,6 +442,8 @@ class Arch:
             "kv_heads": getattr(c, "num_key_value_heads", None) or getattr(c, "num_attention_heads", None),
             "linear_k_heads": getattr(c, "linear_num_key_heads", None),
             "linear_v_heads": getattr(c, "linear_num_value_heads", None) or (lin[0] if lin else None),
-            "post_mlp_norm": self.post_mlp_norm if self.traced else None,
+            # untraced (weights on the meta device): read off the name every such model uses so far
+            "post_mlp_norm": self.post_mlp_norm if self.traced else any(
+                "post_feedforward" in name or "post_mlp" in name for name, _ in self.layers[0].named_modules()),
             "vocab": self.n_vocab,
         }

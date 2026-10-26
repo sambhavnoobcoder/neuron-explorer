@@ -126,11 +126,13 @@ def main():
             centred = "layernorm" in type(ar.pre_norms[l]).__name__.lower()
             if centred:
                 hf = hf - hf.mean(-1, keepdim=True)
-            pred = hf / hf.pow(2).mean(-1, keepdim=True).sqrt() * s
+            norm = ar.pre_norms[l]
+            eps = next((float(v) for k in ("variance_epsilon", "eps", "epsilon") if isinstance(v := getattr(norm, k, None), (int, float))), 0.0)
+            pred = hf / (hf.pow(2).mean(-1, keepdim=True) + eps).sqrt() * s
             if centred and getattr(ar.pre_norms[l], "bias", None) is not None:
                 pred = pred + ar.pre_norms[l].bias.detach().float()
             e = rel(pred, h_out)
-            check("norm", e < max(tol, 1e-2), f"{type(ar.pre_norms[l]).__name__} = x / rms(x) * scale"
+            check("norm", e < max(tol, 1e-2), f"{type(ar.pre_norms[l]).__name__} = x / sqrt(mean(x^2) + eps) * scale"
                   f"{' (after centring, plus bias)' if centred else ''}, relative error {e:.2e}; scale mean {float(s.mean()):.3f}")
         else:
             print("  info   norm   the MLP reads the residual stream unnormalised")
@@ -156,9 +158,12 @@ def main():
     if "final_in" in rec:
         with torch.inference_mode():
             lens = ar.logits(rec["final_in"])[0, -1].float()
+        cap = getattr(ar.config, "final_logit_softcapping", None)
+        if cap:  # Gemma 2 squashes its logits; monotonic, so the lens's rankings are unaffected
+            lens = torch.tanh(lens / cap) * cap
         e = rel(lens, base[: ar.n_vocab])
         check("lens", e < max(tol, 1e-2), f"final norm + unembedding vs the model's own logits, relative error {e:.2e}"
-              + (" (final logit softcapping explains a small gap)" if getattr(ar.config, "final_logit_softcapping", None) else ""))
+              + (f" (after the model's logit softcap of {cap})" if cap else ""))
     else:
         print("  info   lens   no final norm found by tracing; the lens uses the unembedding directly")
     with torch.inference_mode():

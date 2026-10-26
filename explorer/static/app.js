@@ -19,6 +19,9 @@ const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12,
 const index = await api("/api/index");
 const arch = index.arch;
 document.title = `Neuron Explorer · ${index.model}`;
+$("#inf-hi").value = arch.n_layers - 1;  // the run tab's layer filter covers the whole model by default
+// the go-to box's example names a neuron this model has (L22 N2742 is Qwen3.5-4B's)
+if (index.model !== "Qwen/Qwen3.5-4B") $("#jump").placeholder = `L${Math.floor(arch.n_layers * 2 / 3)} N${Math.floor(arch.inter * 0.3)}`;
 const tip = $("#tip");
 
 // ---------- map ----------
