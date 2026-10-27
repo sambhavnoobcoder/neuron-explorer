@@ -226,6 +226,8 @@ def main():
         text = tok.apply_chat_template([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": mark}],
                                        tokenize=False)
         after = tok(text[text.rindex(mark) + len(mark):], add_special_tokens=False).input_ids
+        # whitespace before the end-of-turn token (DeepSeek-Coder's "\n<|EOT|>") is generated like any other text
+        after = [t for t in after if tok.decode([t]).strip()]
         check("stop", bool(after) and after[0] in stop, f"the template ends a reply with {tok.decode(after[:1])!r}"
               + ("" if after and after[0] in stop else f", not one of the stop tokens"))
     else:
